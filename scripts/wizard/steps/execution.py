@@ -40,7 +40,8 @@ def run_execution_step(step_label: str = "Step 3/4") -> ExecutionStepResult:
 
     include_bash_tool = ask_yes_no("Enable bash command execution?", default=False)
     include_write_tools = ask_yes_no(
-        "Enable file write tools (write_file, str_replace)?", default=True
+        "Enable file write tools (write_file, str_replace, apply_patch, file ops)?",
+        default=True,
     )
 
     return ExecutionStepResult(

@@ -11,7 +11,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 from deerflow.sandbox.middleware import SandboxMiddleware
-from deerflow.sandbox.sandbox import Sandbox
+from deerflow.sandbox.sandbox import FileMetadata, Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider, reset_sandbox_provider, set_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
 from deerflow.sandbox.tools import ls_tool
@@ -46,6 +46,21 @@ class _SandboxStub(Sandbox):
         return ["/mnt/user-data/workspace/file.txt"]
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
+        return None
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        return FileMetadata(path=path, exists=True, is_file=True, is_dir=False, size=7, modified_time=123.0)
+
+    def create_dir(self, path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+        return None
+
+    def remove_file(self, path: str) -> None:
+        return None
+
+    def move_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        return None
+
+    def copy_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
         return None
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:

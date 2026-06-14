@@ -14,8 +14,19 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from deerflow.agents.thread_state import ThreadState
+from deerflow.sandbox.patch import parse_patch
 
 logger = logging.getLogger(__name__)
+
+_FILE_WRITE_AUDIT_TOOLS = {
+    "write_file",
+    "str_replace",
+    "apply_patch",
+    "mkdir",
+    "remove_file",
+    "move_file",
+    "copy_file",
+}
 
 # ---------------------------------------------------------------------------
 # Command classification rules
@@ -242,6 +253,50 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         }
         logger.info("[SandboxAudit] %s", json.dumps(record, ensure_ascii=False))
 
+    def _write_file_audit(self, thread_id: str | None, tool_name: str, args: dict) -> None:
+        paths = []
+        for key in ("path", "source_path", "dest_path"):
+            value = args.get(key)
+            if isinstance(value, str):
+                paths.append(value)
+
+        patch_text = args.get("patch_text")
+        patch_chars = len(patch_text) if isinstance(patch_text, str) else None
+        operation_counts = None
+        patch_parse_error = None
+        if tool_name == "apply_patch" and isinstance(patch_text, str):
+            paths = []
+            operation_counts = {"added": 0, "updated": 0, "deleted": 0, "moved": 0}
+            try:
+                operations = parse_patch(patch_text)
+                for operation in operations:
+                    paths.append(operation.path)
+                    if operation.kind == "add":
+                        operation_counts["added"] += 1
+                    elif operation.kind == "delete":
+                        operation_counts["deleted"] += 1
+                    elif operation.kind == "update":
+                        if operation.chunks:
+                            operation_counts["updated"] += 1
+                        if operation.move_path is not None:
+                            paths.append(operation.move_path)
+                            operation_counts["moved"] += 1
+                paths = sorted(set(paths))
+            except Exception as e:  # pragma: no cover - exact parser errors are covered by middleware tests
+                patch_parse_error = str(e)
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "thread_id": thread_id or "unknown",
+            "tool": tool_name,
+            "paths": paths,
+            "patch_chars": patch_chars,
+        }
+        if operation_counts is not None:
+            record["operation_counts"] = operation_counts
+        if patch_parse_error is not None:
+            record["patch_parse_error"] = patch_parse_error
+        logger.info("[SandboxAudit] %s", json.dumps(record, ensure_ascii=False))
+
     def _build_block_message(self, request: ToolCallRequest, reason: str) -> ToolMessage:
         tool_call_id = str(request.tool_call.get("id") or "missing_id")
         return ToolMessage(
@@ -332,7 +387,13 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
-        if request.tool_call.get("name") != "bash":
+        tool_name = request.tool_call.get("name")
+        if tool_name in _FILE_WRITE_AUDIT_TOOLS:
+            args = request.tool_call.get("args", {})
+            self._write_file_audit(self._get_thread_id(request), str(tool_name), args if isinstance(args, dict) else {})
+            return handler(request)
+
+        if tool_name != "bash":
             return handler(request)
 
         command, _, verdict, reject_reason = self._pre_process(request)
@@ -350,7 +411,13 @@ class SandboxAuditMiddleware(AgentMiddleware[ThreadState]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
-        if request.tool_call.get("name") != "bash":
+        tool_name = request.tool_call.get("name")
+        if tool_name in _FILE_WRITE_AUDIT_TOOLS:
+            args = request.tool_call.get("args", {})
+            self._write_file_audit(self._get_thread_id(request), str(tool_name), args if isinstance(args, dict) else {})
+            return await handler(request)
+
+        if tool_name != "bash":
             return await handler(request)
 
         command, _, verdict, reject_reason = self._pre_process(request)

@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.sandbox.local.list_dir import list_dir
-from deerflow.sandbox.sandbox import Sandbox
+from deerflow.sandbox.sandbox import FileMetadata, Sandbox
 from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matches
 
 logger = logging.getLogger(__name__)
@@ -427,6 +427,98 @@ class LocalSandbox(Sandbox):
         except OSError as e:
             # Re-raise with the original path for clearer error messages, hiding internal resolved paths
             raise type(e)(e.errno, e.strerror, path) from None
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        resolved_path = self._resolve_path(path)
+        try:
+            stat_result = os.stat(resolved_path)
+        except FileNotFoundError:
+            return FileMetadata(
+                path=self._reverse_resolve_path(path),
+                exists=False,
+                is_file=False,
+                is_dir=False,
+            )
+        except OSError as e:
+            raise type(e)(e.errno, e.strerror, path) from None
+
+        return FileMetadata(
+            path=self._reverse_resolve_path(resolved_path),
+            exists=True,
+            is_file=os.path.isfile(resolved_path),
+            is_dir=os.path.isdir(resolved_path),
+            size=stat_result.st_size,
+            modified_time=stat_result.st_mtime,
+        )
+
+    def create_dir(self, path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+        resolved = self._resolve_path_with_mapping(path)
+        resolved_path = resolved.path
+        if self._is_resolved_path_read_only(resolved):
+            raise OSError(errno.EROFS, "Read-only file system", path)
+        try:
+            if parents:
+                os.makedirs(resolved_path, exist_ok=exist_ok)
+            else:
+                os.mkdir(resolved_path)
+        except OSError as e:
+            raise type(e)(e.errno, e.strerror, path) from None
+
+    def remove_file(self, path: str) -> None:
+        resolved = self._resolve_path_with_mapping(path)
+        resolved_path = resolved.path
+        if self._is_resolved_path_read_only(resolved):
+            raise OSError(errno.EROFS, "Read-only file system", path)
+        try:
+            if os.path.isdir(resolved_path):
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", path)
+            os.remove(resolved_path)
+            self._agent_written_paths.discard(resolved_path)
+        except OSError as e:
+            raise type(e)(e.errno, e.strerror, path) from None
+
+    def move_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        source = self._resolve_path_with_mapping(source_path)
+        dest = self._resolve_path_with_mapping(dest_path)
+        if self._is_resolved_path_read_only(source):
+            raise OSError(errno.EROFS, "Read-only file system", source_path)
+        if self._is_resolved_path_read_only(dest):
+            raise OSError(errno.EROFS, "Read-only file system", dest_path)
+        try:
+            if os.path.isdir(source.path):
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", source_path)
+            if os.path.exists(dest.path) and not overwrite:
+                raise FileExistsError(errno.EEXIST, "File exists", dest_path)
+            dest_dir = os.path.dirname(dest.path)
+            if dest_dir:
+                os.makedirs(dest_dir, exist_ok=True)
+            os.replace(source.path, dest.path) if overwrite else os.rename(source.path, dest.path)
+            if source.path in self._agent_written_paths:
+                self._agent_written_paths.discard(source.path)
+                self._agent_written_paths.add(dest.path)
+        except OSError as e:
+            error_path = dest_path if isinstance(e, FileExistsError) else source_path
+            raise type(e)(e.errno, e.strerror, error_path) from None
+
+    def copy_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        source = self._resolve_path_with_mapping(source_path)
+        dest = self._resolve_path_with_mapping(dest_path)
+        if self._is_resolved_path_read_only(dest):
+            raise OSError(errno.EROFS, "Read-only file system", dest_path)
+        try:
+            if os.path.isdir(source.path):
+                raise IsADirectoryError(errno.EISDIR, "Is a directory", source_path)
+            if os.path.exists(dest.path) and not overwrite:
+                raise FileExistsError(errno.EEXIST, "File exists", dest_path)
+            dest_dir = os.path.dirname(dest.path)
+            if dest_dir:
+                os.makedirs(dest_dir, exist_ok=True)
+            shutil.copyfile(source.path, dest.path)
+            if source.path in self._agent_written_paths:
+                self._agent_written_paths.add(dest.path)
+        except OSError as e:
+            error_path = dest_path if isinstance(e, FileExistsError) else source_path
+            raise type(e)(e.errno, e.strerror, error_path) from None
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         resolved_path = Path(self._resolve_path(path))

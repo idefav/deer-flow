@@ -1,5 +1,6 @@
 """Tests for AioSandbox concurrent command serialization (#1433)."""
 
+import json
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -233,6 +234,57 @@ class TestConcurrentFileWrites:
             thread.join()
 
         assert storage["content"] in {"seed\nA\nB\n", "seed\nB\nA\n"}
+
+
+class TestFileOperations:
+    def test_get_metadata_parses_shell_json(self, sandbox):
+        calls = []
+
+        def mock_exec(command, **kwargs):
+            calls.append((command, kwargs))
+            return SimpleNamespace(
+                data=SimpleNamespace(
+                    output=json.dumps(
+                        {
+                            "ok": True,
+                            "path": "/tmp/app.py",
+                            "exists": True,
+                            "is_file": True,
+                            "is_dir": False,
+                            "size": 12,
+                            "modified_time": 123.0,
+                        }
+                    )
+                )
+            )
+
+        sandbox._client.shell.exec_command = mock_exec
+
+        metadata = sandbox.get_metadata("/tmp/app.py")
+
+        assert metadata.path == "/tmp/app.py"
+        assert metadata.exists is True
+        assert metadata.is_file is True
+        assert metadata.size == 12
+        assert calls[0][1].get("no_change_timeout") == sandbox._DEFAULT_NO_CHANGE_TIMEOUT
+
+    def test_remove_file_maps_directory_error(self, sandbox):
+        sandbox._client.shell.exec_command = MagicMock(
+            return_value=SimpleNamespace(
+                data=SimpleNamespace(
+                    output=json.dumps(
+                        {
+                            "ok": False,
+                            "type": "IsADirectoryError",
+                            "error": "/tmp/dir",
+                        }
+                    )
+                )
+            )
+        )
+
+        with pytest.raises(IsADirectoryError):
+            sandbox.remove_file("/tmp/dir")
 
 
 class TestDownloadFile:

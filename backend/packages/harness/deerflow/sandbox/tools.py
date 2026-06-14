@@ -4,6 +4,7 @@ import posixpath
 import re
 import shlex
 from collections.abc import Callable
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from langchain.tools import tool
@@ -17,6 +18,14 @@ from deerflow.sandbox.exceptions import (
     SandboxRuntimeError,
 )
 from deerflow.sandbox.file_operation_lock import get_file_operation_lock
+from deerflow.sandbox.patch import (
+    PatchError,
+    PatchOperation,
+    PatchSummary,
+    build_added_content,
+    derive_updated_content,
+    parse_patch,
+)
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
@@ -1680,6 +1689,412 @@ async def _read_file_tool_async(
 
 
 read_file_tool.coroutine = _read_file_tool_async
+
+
+def _workspace_relative_to_virtual(path: str) -> str:
+    """Map a patch-relative path to the thread workspace virtual path."""
+    normalized = path.replace("\\", "/").strip()
+    if not normalized:
+        raise ValueError("Path cannot be empty")
+    if _URL_WITH_SCHEME_PATTERN.match(normalized):
+        raise PermissionError(f"Unsupported path scheme: {path}")
+    if normalized.startswith("/"):
+        return normalized
+    _reject_path_traversal(normalized)
+    return posixpath.normpath(f"{VIRTUAL_PATH_PREFIX}/workspace/{normalized}")
+
+
+def _prepare_file_tool_path(
+    path: str,
+    runtime: Runtime,
+    *,
+    read_only: bool = False,
+    allow_relative_workspace: bool = False,
+) -> str:
+    prepared = _workspace_relative_to_virtual(path) if allow_relative_workspace else path
+    _reject_path_traversal(prepared)
+    if is_local_sandbox(runtime):
+        thread_data = get_thread_data(runtime)
+        validate_local_tool_path(prepared, thread_data, read_only=read_only)
+        if _is_skills_path(prepared):
+            return _resolve_skills_path(prepared)
+        if _is_acp_workspace_path(prepared):
+            return _resolve_acp_workspace_path(prepared, _extract_thread_id_from_thread_data(thread_data))
+        if not _is_custom_mount_path(prepared):
+            return _resolve_and_validate_user_data_path(prepared, thread_data)
+    return prepared
+
+
+@contextmanager
+def _file_operation_locks(sandbox: Sandbox, paths: list[str]):
+    unique_paths = sorted(set(paths))
+    with ExitStack() as stack:
+        for path in unique_paths:
+            stack.enter_context(get_file_operation_lock(sandbox, path))
+        yield
+
+
+def _format_metadata(metadata) -> str:
+    if not metadata.exists:
+        return f"{metadata.path}: missing"
+    kind = "directory" if metadata.is_dir else "file" if metadata.is_file else "other"
+    parts = [f"{metadata.path}: {kind}"]
+    if metadata.size is not None:
+        parts.append(f"size={metadata.size}")
+    if metadata.modified_time is not None:
+        parts.append(f"modified_time={metadata.modified_time}")
+    return ", ".join(parts)
+
+
+def _summarize_patch(summary: PatchSummary) -> str:
+    return f"OK: applied patch (added {summary.added}, updated {summary.updated}, deleted {summary.deleted}, moved {summary.moved})"
+
+
+def _resolve_patch_operations(operations: list[PatchOperation], runtime: Runtime) -> list[PatchOperation]:
+    resolved: list[PatchOperation] = []
+    for operation in operations:
+        path = _prepare_file_tool_path(
+            operation.path,
+            runtime,
+            read_only=False,
+            allow_relative_workspace=True,
+        )
+        move_path = None
+        if operation.move_path is not None:
+            move_path = _prepare_file_tool_path(
+                operation.move_path,
+                runtime,
+                read_only=False,
+                allow_relative_workspace=True,
+            )
+        resolved.append(
+            PatchOperation(
+                kind=operation.kind,
+                path=path,
+                lines=operation.lines,
+                chunks=operation.chunks,
+                move_path=move_path,
+            )
+        )
+    return resolved
+
+
+def _apply_patch_operations(sandbox: Sandbox, operations: list[PatchOperation]) -> PatchSummary:
+    summary = PatchSummary()
+    actions: list[tuple[str, str, str | None]] = []
+    virtual_state: dict[str, str | None] = {}
+
+    def current_file_content(path: str) -> str:
+        if path in virtual_state:
+            content = virtual_state[path]
+            if content is None:
+                raise FileNotFoundError(path)
+            return content
+        metadata = sandbox.get_metadata(path)
+        if not metadata.exists:
+            raise FileNotFoundError(path)
+        if metadata.is_dir:
+            raise IsADirectoryError(path)
+        return sandbox.read_file(path)
+
+    for operation in operations:
+        summary.paths.add(operation.path)
+        if operation.move_path is not None:
+            summary.paths.add(operation.move_path)
+
+        if operation.kind == "add":
+            metadata = sandbox.get_metadata(operation.path)
+            if metadata.exists and metadata.is_dir:
+                raise IsADirectoryError(operation.path)
+            content = build_added_content(operation.lines)
+            virtual_state[operation.path] = content
+            actions.append(("write", operation.path, content))
+            summary.added += 1
+            continue
+
+        if operation.kind == "delete":
+            content = current_file_content(operation.path)
+            if content is None:  # pragma: no cover - current_file_content raises
+                raise FileNotFoundError(operation.path)
+            virtual_state[operation.path] = None
+            actions.append(("remove", operation.path, None))
+            summary.deleted += 1
+            continue
+
+        if operation.kind == "update":
+            if operation.move_path == operation.path:
+                raise PatchError(f"Move destination must differ from source: {operation.path}")
+            original = current_file_content(operation.path)
+            new_content = derive_updated_content(original, operation.chunks)
+            if operation.move_path is None:
+                virtual_state[operation.path] = new_content
+                actions.append(("write", operation.path, new_content))
+                summary.updated += 1
+                continue
+
+            dest_metadata = sandbox.get_metadata(operation.move_path)
+            if dest_metadata.exists and dest_metadata.is_dir:
+                raise IsADirectoryError(operation.move_path)
+            virtual_state[operation.path] = None
+            virtual_state[operation.move_path] = new_content
+            actions.append(("write", operation.move_path, new_content))
+            actions.append(("remove", operation.path, None))
+            summary.moved += 1
+            if new_content != original:
+                summary.updated += 1
+            continue
+
+        raise PatchError(f"Unsupported patch operation: {operation.kind}")
+
+    for action, path, content in actions:
+        if action == "write":
+            sandbox.write_file(path, content or "", append=False)
+        elif action == "remove":
+            sandbox.remove_file(path)
+    return summary
+
+
+@tool("file_info", parse_docstring=True)
+def file_info_tool(runtime: Runtime, description: str, path: str) -> str:
+    """Return metadata for a file or directory.
+
+    Args:
+        description: Explain why you are inspecting this path in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        path: The **absolute** path to inspect.
+    """
+    requested_path = path
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        path = _prepare_file_tool_path(path, runtime, read_only=True)
+        metadata = sandbox.get_metadata(path)
+        return _format_metadata(metadata)
+    except SandboxError as e:
+        return f"Error: {e}"
+    except PermissionError:
+        return f"Error: Permission denied: {requested_path}"
+    except Exception as e:
+        return f"Error: Unexpected error inspecting path: {_sanitize_error(e, runtime)}"
+
+
+async def _file_info_tool_async(runtime: Runtime, description: str, path: str) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(file_info_tool.func, runtime, description, path)
+
+
+file_info_tool.coroutine = _file_info_tool_async
+
+
+@tool("apply_patch", parse_docstring=True)
+def apply_patch_tool(runtime: Runtime, description: str, patch_text: str) -> str:
+    """Apply a Codex-style patch to one or more text files.
+
+    Args:
+        description: Explain why you are applying this patch in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        patch_text: Patch text using `*** Begin Patch`, `*** Add File`, `*** Delete File`, `*** Update File`, optional `*** Move to`, and `*** End Patch`.
+    """
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        operations = _resolve_patch_operations(parse_patch(patch_text), runtime)
+        affected_paths: list[str] = []
+        for operation in operations:
+            affected_paths.append(operation.path)
+            if operation.move_path is not None:
+                affected_paths.append(operation.move_path)
+        with _file_operation_locks(sandbox, affected_paths):
+            summary = _apply_patch_operations(sandbox, operations)
+        return _summarize_patch(summary)
+    except (PatchError, FileNotFoundError, FileExistsError, IsADirectoryError, PermissionError, OSError) as e:
+        return f"Error: {_sanitize_error(e, runtime)}"
+    except SandboxError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: Unexpected error applying patch: {_sanitize_error(e, runtime)}"
+
+
+async def _apply_patch_tool_async(runtime: Runtime, description: str, patch_text: str) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(apply_patch_tool.func, runtime, description, patch_text)
+
+
+apply_patch_tool.coroutine = _apply_patch_tool_async
+
+
+@tool("mkdir", parse_docstring=True)
+def mkdir_tool(
+    runtime: Runtime,
+    description: str,
+    path: str,
+    parents: bool = True,
+    exist_ok: bool = True,
+) -> str:
+    """Create a directory inside the sandbox.
+
+    Args:
+        description: Explain why you are creating this directory in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        path: The **absolute** directory path to create.
+        parents: Whether to create missing parent directories. Defaults to True.
+        exist_ok: Whether an existing directory should be accepted. Defaults to True.
+    """
+    requested_path = path
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        path = _prepare_file_tool_path(path, runtime, read_only=False)
+        with get_file_operation_lock(sandbox, path):
+            sandbox.create_dir(path, parents=parents, exist_ok=exist_ok)
+        return "OK"
+    except PermissionError:
+        return f"Error: Permission denied creating directory: {requested_path}"
+    except Exception as e:
+        return f"Error: Unexpected error creating directory: {_sanitize_error(e, runtime)}"
+
+
+async def _mkdir_tool_async(
+    runtime: Runtime,
+    description: str,
+    path: str,
+    parents: bool = True,
+    exist_ok: bool = True,
+) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(mkdir_tool.func, runtime, description, path, parents, exist_ok)
+
+
+mkdir_tool.coroutine = _mkdir_tool_async
+
+
+@tool("remove_file", parse_docstring=True)
+def remove_file_tool(runtime: Runtime, description: str, path: str) -> str:
+    """Remove a regular file. Directories are rejected.
+
+    Args:
+        description: Explain why you are removing this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        path: The **absolute** file path to remove.
+    """
+    requested_path = path
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        path = _prepare_file_tool_path(path, runtime, read_only=False)
+        with get_file_operation_lock(sandbox, path):
+            sandbox.remove_file(path)
+        return "OK"
+    except FileNotFoundError:
+        return f"Error: File not found: {requested_path}"
+    except IsADirectoryError:
+        return f"Error: Path is a directory, not a file: {requested_path}"
+    except PermissionError:
+        return f"Error: Permission denied removing file: {requested_path}"
+    except Exception as e:
+        return f"Error: Unexpected error removing file: {_sanitize_error(e, runtime)}"
+
+
+async def _remove_file_tool_async(runtime: Runtime, description: str, path: str) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(remove_file_tool.func, runtime, description, path)
+
+
+remove_file_tool.coroutine = _remove_file_tool_async
+
+
+@tool("move_file", parse_docstring=True)
+def move_file_tool(
+    runtime: Runtime,
+    description: str,
+    source_path: str,
+    dest_path: str,
+    overwrite: bool = False,
+) -> str:
+    """Move or rename a regular file. Directories are rejected.
+
+    Args:
+        description: Explain why you are moving this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        source_path: The **absolute** source file path.
+        dest_path: The **absolute** destination file path.
+        overwrite: Whether to overwrite an existing destination file. Defaults to False.
+    """
+    requested_source = source_path
+    requested_dest = dest_path
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        source_path = _prepare_file_tool_path(source_path, runtime, read_only=False)
+        dest_path = _prepare_file_tool_path(dest_path, runtime, read_only=False)
+        with _file_operation_locks(sandbox, [source_path, dest_path]):
+            sandbox.move_file(source_path, dest_path, overwrite=overwrite)
+        return "OK"
+    except FileNotFoundError:
+        return f"Error: File not found: {requested_source}"
+    except FileExistsError:
+        return f"Error: Destination already exists: {requested_dest}"
+    except IsADirectoryError:
+        return "Error: Source or destination is a directory, not a file"
+    except PermissionError:
+        return f"Error: Permission denied moving file: {requested_source}"
+    except Exception as e:
+        return f"Error: Unexpected error moving file: {_sanitize_error(e, runtime)}"
+
+
+async def _move_file_tool_async(
+    runtime: Runtime,
+    description: str,
+    source_path: str,
+    dest_path: str,
+    overwrite: bool = False,
+) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(move_file_tool.func, runtime, description, source_path, dest_path, overwrite)
+
+
+move_file_tool.coroutine = _move_file_tool_async
+
+
+@tool("copy_file", parse_docstring=True)
+def copy_file_tool(
+    runtime: Runtime,
+    description: str,
+    source_path: str,
+    dest_path: str,
+    overwrite: bool = False,
+) -> str:
+    """Copy a regular file. Directories are rejected.
+
+    Args:
+        description: Explain why you are copying this file in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
+        source_path: The **absolute** source file path.
+        dest_path: The **absolute** destination file path.
+        overwrite: Whether to overwrite an existing destination file. Defaults to False.
+    """
+    requested_source = source_path
+    requested_dest = dest_path
+    try:
+        sandbox = ensure_sandbox_initialized(runtime)
+        ensure_thread_directories_exist(runtime)
+        source_path = _prepare_file_tool_path(source_path, runtime, read_only=True)
+        dest_path = _prepare_file_tool_path(dest_path, runtime, read_only=False)
+        with _file_operation_locks(sandbox, [source_path, dest_path]):
+            sandbox.copy_file(source_path, dest_path, overwrite=overwrite)
+        return "OK"
+    except FileNotFoundError:
+        return f"Error: File not found: {requested_source}"
+    except FileExistsError:
+        return f"Error: Destination already exists: {requested_dest}"
+    except IsADirectoryError:
+        return "Error: Source or destination is a directory, not a file"
+    except PermissionError:
+        return f"Error: Permission denied copying file: {requested_source}"
+    except Exception as e:
+        return f"Error: Unexpected error copying file: {_sanitize_error(e, runtime)}"
+
+
+async def _copy_file_tool_async(
+    runtime: Runtime,
+    description: str,
+    source_path: str,
+    dest_path: str,
+    overwrite: bool = False,
+) -> str:
+    return await _run_sync_tool_after_async_sandbox_init(copy_file_tool.func, runtime, description, source_path, dest_path, overwrite)
+
+
+copy_file_tool.coroutine = _copy_file_tool_async
 
 
 def _effective_write_file_max_bytes() -> int:

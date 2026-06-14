@@ -19,11 +19,17 @@ import pytest
 from langchain.tools import ToolRuntime
 
 from deerflow.sandbox.tools import (
+    apply_patch_tool,
     bash_tool,
+    copy_file_tool,
+    file_info_tool,
     glob_tool,
     grep_tool,
     ls_tool,
+    mkdir_tool,
+    move_file_tool,
     read_file_tool,
+    remove_file_tool,
     str_replace_tool,
     write_file_tool,
 )
@@ -53,8 +59,14 @@ _TOOL_CASES = [
     (glob_tool, {"description": "find", "pattern": "*.py", "path": "/tmp"}),
     (grep_tool, {"description": "search", "pattern": "x", "path": "/tmp"}),
     (read_file_tool, {"description": "read", "path": "/tmp/x"}),
+    (file_info_tool, {"description": "inspect", "path": "/tmp/x"}),
     (write_file_tool, {"description": "write", "path": "/tmp/x", "content": "hi"}),
     (str_replace_tool, {"description": "replace", "path": "/tmp/x", "old_str": "a", "new_str": "b"}),
+    (apply_patch_tool, {"description": "patch", "patch_text": "*** Begin Patch\n*** End Patch\n"}),
+    (mkdir_tool, {"description": "mkdir", "path": "/tmp/x"}),
+    (remove_file_tool, {"description": "remove", "path": "/tmp/x"}),
+    (move_file_tool, {"description": "move", "source_path": "/tmp/a", "dest_path": "/tmp/b"}),
+    (copy_file_tool, {"description": "copy", "source_path": "/tmp/a", "dest_path": "/tmp/b"}),
     (present_file_tool, {"filepaths": ["/tmp/x"], "tool_call_id": "call-1"}),
     (view_image_tool, {"image_path": "/tmp/img.png", "tool_call_id": "call-1"}),
     (task_tool, {"description": "do", "prompt": "go", "subagent_type": "general-purpose", "tool_call_id": "call-1"}),

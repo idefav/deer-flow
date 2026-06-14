@@ -84,10 +84,16 @@ def _default_tools() -> list[dict[str, Any]]:
         {"name": "image_search", "use": "deerflow.community.image_search.tools:image_search_tool", "group": "web", "max_results": 5},
         {"name": "ls", "use": "deerflow.sandbox.tools:ls_tool", "group": "file:read"},
         {"name": "read_file", "use": "deerflow.sandbox.tools:read_file_tool", "group": "file:read"},
+        {"name": "file_info", "use": "deerflow.sandbox.tools:file_info_tool", "group": "file:read"},
         {"name": "glob", "use": "deerflow.sandbox.tools:glob_tool", "group": "file:read"},
         {"name": "grep", "use": "deerflow.sandbox.tools:grep_tool", "group": "file:read"},
         {"name": "write_file", "use": "deerflow.sandbox.tools:write_file_tool", "group": "file:write"},
         {"name": "str_replace", "use": "deerflow.sandbox.tools:str_replace_tool", "group": "file:write"},
+        {"name": "apply_patch", "use": "deerflow.sandbox.tools:apply_patch_tool", "group": "file:write"},
+        {"name": "mkdir", "use": "deerflow.sandbox.tools:mkdir_tool", "group": "file:write"},
+        {"name": "remove_file", "use": "deerflow.sandbox.tools:remove_file_tool", "group": "file:write"},
+        {"name": "move_file", "use": "deerflow.sandbox.tools:move_file_tool", "group": "file:write"},
+        {"name": "copy_file", "use": "deerflow.sandbox.tools:copy_file_tool", "group": "file:write"},
         {"name": "bash", "use": "deerflow.sandbox.tools:bash_tool", "group": "bash"},
     ]
 
@@ -108,7 +114,19 @@ def _build_tools(
     tools = [
         tool
         for tool in tools
-        if tool.get("name") not in {search_tool_name, web_fetch_tool_name, "write_file", "str_replace", "bash"}
+        if tool.get("name")
+        not in {
+            search_tool_name,
+            web_fetch_tool_name,
+            "write_file",
+            "str_replace",
+            "apply_patch",
+            "mkdir",
+            "remove_file",
+            "move_file",
+            "copy_file",
+            "bash",
+        }
     ]
 
     web_group = "web"
@@ -139,6 +157,11 @@ def _build_tools(
             [
                 {"name": "write_file", "use": "deerflow.sandbox.tools:write_file_tool", "group": "file:write"},
                 {"name": "str_replace", "use": "deerflow.sandbox.tools:str_replace_tool", "group": "file:write"},
+                {"name": "apply_patch", "use": "deerflow.sandbox.tools:apply_patch_tool", "group": "file:write"},
+                {"name": "mkdir", "use": "deerflow.sandbox.tools:mkdir_tool", "group": "file:write"},
+                {"name": "remove_file", "use": "deerflow.sandbox.tools:remove_file_tool", "group": "file:write"},
+                {"name": "move_file", "use": "deerflow.sandbox.tools:move_file_tool", "group": "file:write"},
+                {"name": "copy_file", "use": "deerflow.sandbox.tools:copy_file_tool", "group": "file:write"},
             ]
         )
 

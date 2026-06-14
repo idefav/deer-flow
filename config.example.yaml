@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 12
+config_version: 13
 
 # ============================================================================
 # Logging
@@ -636,6 +636,10 @@ tools:
     group: file:read
     use: deerflow.sandbox.tools:read_file_tool
 
+  - name: file_info
+    group: file:read
+    use: deerflow.sandbox.tools:file_info_tool
+
   - name: glob
     group: file:read
     use: deerflow.sandbox.tools:glob_tool
@@ -653,6 +657,26 @@ tools:
   - name: str_replace
     group: file:write
     use: deerflow.sandbox.tools:str_replace_tool
+
+  - name: apply_patch
+    group: file:write
+    use: deerflow.sandbox.tools:apply_patch_tool
+
+  - name: mkdir
+    group: file:write
+    use: deerflow.sandbox.tools:mkdir_tool
+
+  - name: remove_file
+    group: file:write
+    use: deerflow.sandbox.tools:remove_file_tool
+
+  - name: move_file
+    group: file:write
+    use: deerflow.sandbox.tools:move_file_tool
+
+  - name: copy_file
+    group: file:write
+    use: deerflow.sandbox.tools:copy_file_tool
 
   # Bash execution tool
   # Active only when using an isolated shell sandbox or when

@@ -189,6 +189,11 @@ class TestHashToolCalls:
         }
         assert _hash_tool_calls([a]) != _hash_tool_calls([b])
 
+    def test_apply_patch_content_affects_hash(self):
+        a = {"name": "apply_patch", "args": {"patch_text": "*** Begin Patch\n*** End Patch\n"}}
+        b = {"name": "apply_patch", "args": {"patch_text": "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch\n"}}
+        assert _hash_tool_calls([a]) != _hash_tool_calls([b])
+
 
 class TestLoopDetection:
     def test_no_tool_calls_returns_none(self):

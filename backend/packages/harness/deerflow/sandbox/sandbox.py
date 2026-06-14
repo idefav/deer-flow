@@ -1,6 +1,19 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from deerflow.sandbox.search import GrepMatch
+
+
+@dataclass(frozen=True)
+class FileMetadata:
+    """Metadata for a path inside a sandbox."""
+
+    path: str
+    exists: bool
+    is_file: bool
+    is_dir: bool
+    size: int | None = None
+    modified_time: float | None = None
 
 
 class Sandbox(ABC):
@@ -80,6 +93,31 @@ class Sandbox(ABC):
             content: The text content to write to the file.
             append: Whether to append the content to the file. If False, the file will be created or overwritten.
         """
+        pass
+
+    @abstractmethod
+    def get_metadata(self, path: str) -> FileMetadata:
+        """Return metadata for a file-system path."""
+        pass
+
+    @abstractmethod
+    def create_dir(self, path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+        """Create a directory."""
+        pass
+
+    @abstractmethod
+    def remove_file(self, path: str) -> None:
+        """Remove a regular file."""
+        pass
+
+    @abstractmethod
+    def move_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        """Move or rename a regular file."""
+        pass
+
+    @abstractmethod
+    def copy_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        """Copy a regular file."""
         pass
 
     @abstractmethod

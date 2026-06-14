@@ -269,6 +269,28 @@ class TestBuildMinimalConfig:
         tool_names = [t["name"] for t in data.get("tools", [])]
         assert "write_file" not in tool_names
         assert "str_replace" not in tool_names
+        assert "apply_patch" not in tool_names
+        assert "mkdir" not in tool_names
+        assert "remove_file" not in tool_names
+        assert "move_file" not in tool_names
+        assert "copy_file" not in tool_names
+
+    def test_write_tools_include_patch_and_file_operations(self):
+        content = build_minimal_config(
+            provider_use="langchain_openai:ChatOpenAI",
+            model_name="gpt-4o",
+            display_name="OpenAI",
+            api_key_field="api_key",
+            env_var="OPENAI_API_KEY",
+            include_write_tools=True,
+        )
+        data = yaml.safe_load(content)
+        tool_names = [t["name"] for t in data.get("tools", [])]
+        assert "apply_patch" in tool_names
+        assert "mkdir" in tool_names
+        assert "remove_file" in tool_names
+        assert "move_file" in tool_names
+        assert "copy_file" in tool_names
 
     def test_config_version_present(self):
         content = build_minimal_config(
@@ -557,6 +579,7 @@ class TestWriteConfigYaml:
                             "max_results": 5,
                         },
                         {"name": "ls", "group": "file:read", "use": "deerflow.sandbox.tools:ls_tool"},
+                        {"name": "file_info", "group": "file:read", "use": "deerflow.sandbox.tools:file_info_tool"},
                         {"name": "write_file", "group": "file:write", "use": "deerflow.sandbox.tools:write_file_tool"},
                         {"name": "bash", "group": "bash", "use": "deerflow.sandbox.tools:bash_tool"},
                     ],
@@ -587,6 +610,7 @@ class TestWriteConfigYaml:
         assert data["tool_groups"][0]["name"] == "web"
         assert data["summarization"]["max_tokens"] == 2048
         assert any(tool["name"] == "image_search" and tool["max_results"] == 5 for tool in data["tools"])
+        assert any(tool["name"] == "file_info" for tool in data["tools"])
 
     def test_config_version_read_from_example(self, tmp_path):
         """write_config_yaml should read config_version from config.example.yaml if present."""

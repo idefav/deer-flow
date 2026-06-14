@@ -36,7 +36,7 @@ deer-flow/
 │   │           ├── sandbox/           # Sandbox execution system
 │   │           │   ├── local/         # Local filesystem provider
 │   │           │   ├── sandbox.py     # Abstract Sandbox interface
-│   │           │   ├── tools.py       # bash, ls, read/write/str_replace
+│   │           │   ├── tools.py       # bash, ls, read/write/patch/file ops
 │   │           │   └── middleware.py  # Sandbox lifecycle management
 │   │           ├── subagents/         # Subagent delegation system
 │   │           │   ├── builtins/      # general-purpose, bash agents
@@ -288,7 +288,7 @@ Proxied through nginx: `/api/langgraph/*` → Gateway LangGraph-compatible runti
 
 ### Sandbox System (`packages/harness/deerflow/sandbox/`)
 
-**Interface**: Abstract `Sandbox` with `execute_command`, `read_file`, `write_file`, `list_dir`
+**Interface**: Abstract `Sandbox` with `execute_command`, `read_file`, `write_file`, `list_dir`, metadata, directory creation, and file copy/move/remove helpers
 **Provider Pattern**: `SandboxProvider` with `acquire`, `acquire_async`, `get`, `release` lifecycle. Async agent/tool paths call async sandbox lifecycle hooks so Docker sandbox creation, discovery, cross-process locking, readiness polling, and release stay off the event loop.
 **Implementations**:
 - `LocalSandboxProvider` - Local filesystem execution. `acquire(thread_id)` returns a per-thread `LocalSandbox` (id `local:{thread_id}`) whose `path_mappings` resolve `/mnt/user-data/{workspace,uploads,outputs}` and `/mnt/acp-workspace` to that thread's host directories, so the public `Sandbox` API honours the `/mnt/user-data` contract uniformly with AIO. `acquire()` / `acquire(None)` keeps the legacy generic singleton (id `local`) for callers without a thread context. Per-thread sandboxes are held in an LRU cache (default 256 entries) guarded by a `threading.Lock`.
@@ -306,6 +306,8 @@ Proxied through nginx: `/api/langgraph/*` → Gateway LangGraph-compatible runti
 - `read_file` - Read file contents with optional line range
 - `write_file` - Write/append to files, creates directories; overwrites by default and exposes the `append` argument in the model-facing schema for end-of-file writes
 - `str_replace` - Substring replacement (single or all occurrences); same-path serialization is scoped to `(sandbox.id, path)` so isolated sandboxes do not contend on identical virtual paths inside one process
+- `file_info`, `mkdir`, `remove_file`, `move_file`, `copy_file` - Metadata and basic file-management operations exposed through the same sandbox path validation and locking layer
+- `apply_patch` - Codex-style patch application across add/update/delete/move operations. Update hunks use exact matching; pure insertions require either `@@ <context>` (insert after the matching line) or `*** End of File` (append at EOF). Same-path `Move to` is rejected before mutation, and `SandboxAuditMiddleware` records patch paths and operation counts without blocking tool execution on audit parse failures.
 
 ### Subagent System (`packages/harness/deerflow/subagents/`)
 

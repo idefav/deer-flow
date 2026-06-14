@@ -68,13 +68,13 @@ Middlewares execute in strict order, each handling a specific concern:
 
 Per-thread isolated execution with virtual path translation:
 
-- **Abstract interface**: `execute_command`, `read_file`, `write_file`, `list_dir`
+- **Abstract interface**: `execute_command`, `read_file`, `write_file`, `list_dir`, metadata and file-management helpers
 - **Providers**: `LocalSandboxProvider` (filesystem) and `AioSandboxProvider` (Docker, in community/). Async runtime paths use async sandbox lifecycle hooks so startup, readiness polling, and release do not block the event loop. `AioSandboxProvider` validates active-cache and warm-pool containers during acquire/reuse, dropping definitively dead entries so a thread can provision a fresh sandbox after an unexpected container exit while keeping `get()` as an in-memory lookup. Backend health-check failures are treated as unknown, not dead, and a container that cannot be verified during discovery is simply not adopted (acquire falls through to create instead of failing).
 - **Virtual paths**: `/mnt/user-data/{workspace,uploads,outputs}` → thread-specific physical directories
 - **Skills path**: `/mnt/skills` → `deer-flow/skills/` directory
 - **Skills loading**: Recursively discovers nested `SKILL.md` files under `skills/{public,custom}` and preserves nested container paths
-- **File-write safety**: `str_replace` serializes read-modify-write per `(sandbox.id, path)` so isolated sandboxes keep concurrency even when virtual paths match
-- **Tools**: `bash`, `ls`, `read_file`, `write_file`, `str_replace` (`write_file` overwrites by default and exposes `append` for end-of-file writes; `bash` is disabled by default when using `LocalSandboxProvider`; use `AioSandboxProvider` for isolated shell access)
+- **File-write safety**: `str_replace` and `apply_patch` serialize read-modify-write per `(sandbox.id, path)` so isolated sandboxes keep concurrency even when virtual paths match
+- **Tools**: `bash`, `ls`, `read_file`, `write_file`, `str_replace`, `file_info`, `apply_patch`, `mkdir`, `remove_file`, `move_file`, `copy_file` (`write_file` overwrites by default and exposes `append` for end-of-file writes; `apply_patch` uses exact Codex-style hunks with `@@ <context>` and `*** End of File`; `bash` is disabled by default when using `LocalSandboxProvider`; use `AioSandboxProvider` for isolated shell access)
 
 ### Subagent System
 
@@ -99,7 +99,7 @@ LLM-powered persistent context retention across conversations:
 
 | Category | Tools |
 |----------|-------|
-| **Sandbox** | `bash`, `ls`, `read_file`, `write_file`, `str_replace` |
+| **Sandbox** | `bash`, `ls`, `read_file`, `write_file`, `str_replace`, `file_info`, `apply_patch`, `mkdir`, `remove_file`, `move_file`, `copy_file` |
 | **Built-in** | `present_files`, `ask_clarification`, `view_image`, `task` (subagent) |
 | **Community** | Tavily (web search), Jina AI (web fetch), Firecrawl (scraping), DuckDuckGo (image search) |
 | **MCP** | Any Model Context Protocol server (stdio, SSE, HTTP transports) |

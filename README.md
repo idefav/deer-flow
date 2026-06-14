@@ -654,6 +654,8 @@ DeerFlow doesn't just *talk* about doing things. It has its own computer.
 
 Each task gets its own execution environment with a full filesystem view — skills, workspace, uploads, outputs. The agent reads, writes, and edits files. It can view images and, when configured safely, execute shell commands.
 
+File editing includes direct writes, string replacement, metadata inspection, directory creation, file copy/move/remove, and Codex-style `apply_patch` edits. Patch hunks use exact context matching; `@@ <context>` anchors pure insertions after the matching line, and `*** End of File` appends at EOF.
+
 With `AioSandboxProvider`, shell execution runs inside isolated containers. With `LocalSandboxProvider`, file tools still map to per-thread directories on the host, but host `bash` is disabled by default because it is not a secure isolation boundary. Re-enable host bash only for fully trusted local workflows.
 
 This is the difference between a chatbot with tool access and an agent with an actual execution environment.

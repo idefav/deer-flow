@@ -1,5 +1,6 @@
 import base64
 import errno
+import json
 import logging
 import shlex
 import threading
@@ -8,7 +9,7 @@ import uuid
 from agent_sandbox import Sandbox as AioSandboxClient
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
-from deerflow.sandbox.sandbox import Sandbox
+from deerflow.sandbox.sandbox import FileMetadata, Sandbox
 from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path, truncate_line
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,117 @@ class AioSandbox(Sandbox):
             except Exception as e:
                 logger.error(f"Failed to write file in sandbox: {e}")
                 raise
+
+    def _run_python_json(self, code: str, *args: str) -> dict:
+        command = " ".join(["python3", "-c", shlex.quote(code), *(shlex.quote(arg) for arg in args)])
+        with self._lock:
+            result = self._client.shell.exec_command(command=command, no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT)
+            output = result.data.output if result.data else ""
+
+        payload = output.strip().splitlines()[-1] if output and output.strip() else ""
+        if not payload:
+            raise OSError("sandbox file operation produced no output")
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise OSError(f"sandbox file operation returned invalid output: {output}") from exc
+        if data.get("ok") is False:
+            error_type = data.get("type") or "OSError"
+            message = data.get("error") or "sandbox file operation failed"
+            if error_type == "FileNotFoundError":
+                raise FileNotFoundError(message)
+            if error_type == "FileExistsError":
+                raise FileExistsError(message)
+            if error_type == "IsADirectoryError":
+                raise IsADirectoryError(message)
+            if error_type == "NotADirectoryError":
+                raise NotADirectoryError(message)
+            raise OSError(message)
+        return data
+
+    def get_metadata(self, path: str) -> FileMetadata:
+        code = (
+            "import json, os, sys\n"
+            "p = sys.argv[1]\n"
+            "if not os.path.exists(p):\n"
+            "    print(json.dumps({'ok': True, 'path': p, 'exists': False, 'is_file': False, 'is_dir': False, 'size': None, 'modified_time': None}))\n"
+            "else:\n"
+            "    st = os.stat(p)\n"
+            "    print(json.dumps({'ok': True, 'path': p, 'exists': True, 'is_file': os.path.isfile(p), 'is_dir': os.path.isdir(p), 'size': st.st_size, 'modified_time': st.st_mtime}))\n"
+        )
+        data = self._run_python_json(code, path)
+        return FileMetadata(
+            path=str(data["path"]),
+            exists=bool(data["exists"]),
+            is_file=bool(data["is_file"]),
+            is_dir=bool(data["is_dir"]),
+            size=data.get("size"),
+            modified_time=data.get("modified_time"),
+        )
+
+    def create_dir(self, path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+        code = (
+            "import json, os, sys\n"
+            "p, parents, exist_ok = sys.argv[1], sys.argv[2] == '1', sys.argv[3] == '1'\n"
+            "try:\n"
+            "    os.makedirs(p, exist_ok=exist_ok) if parents else os.mkdir(p)\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'type': type(exc).__name__, 'error': str(exc)}))\n"
+        )
+        self._run_python_json(code, path, "1" if parents else "0", "1" if exist_ok else "0")
+
+    def remove_file(self, path: str) -> None:
+        code = (
+            "import json, os, sys\n"
+            "p = sys.argv[1]\n"
+            "try:\n"
+            "    if os.path.isdir(p):\n"
+            "        raise IsADirectoryError(p)\n"
+            "    os.remove(p)\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'type': type(exc).__name__, 'error': str(exc)}))\n"
+        )
+        self._run_python_json(code, path)
+
+    def move_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        code = (
+            "import json, os, sys\n"
+            "src, dst, overwrite = sys.argv[1], sys.argv[2], sys.argv[3] == '1'\n"
+            "try:\n"
+            "    if os.path.isdir(src):\n"
+            "        raise IsADirectoryError(src)\n"
+            "    if os.path.exists(dst) and not overwrite:\n"
+            "        raise FileExistsError(dst)\n"
+            "    parent = os.path.dirname(dst)\n"
+            "    if parent:\n"
+            "        os.makedirs(parent, exist_ok=True)\n"
+            "    os.replace(src, dst) if overwrite else os.rename(src, dst)\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'type': type(exc).__name__, 'error': str(exc)}))\n"
+        )
+        self._run_python_json(code, source_path, dest_path, "1" if overwrite else "0")
+
+    def copy_file(self, source_path: str, dest_path: str, *, overwrite: bool = False) -> None:
+        code = (
+            "import json, os, shutil, sys\n"
+            "src, dst, overwrite = sys.argv[1], sys.argv[2], sys.argv[3] == '1'\n"
+            "try:\n"
+            "    if os.path.isdir(src):\n"
+            "        raise IsADirectoryError(src)\n"
+            "    if os.path.exists(dst) and not overwrite:\n"
+            "        raise FileExistsError(dst)\n"
+            "    parent = os.path.dirname(dst)\n"
+            "    if parent:\n"
+            "        os.makedirs(parent, exist_ok=True)\n"
+            "    shutil.copyfile(src, dst)\n"
+            "    print(json.dumps({'ok': True}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'type': type(exc).__name__, 'error': str(exc)}))\n"
+        )
+        self._run_python_json(code, source_path, dest_path, "1" if overwrite else "0")
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         if not include_dirs:

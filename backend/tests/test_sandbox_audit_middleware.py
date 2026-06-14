@@ -1,5 +1,7 @@
 """Tests for SandboxAuditMiddleware - command classification and audit logging."""
 
+import json
+import logging
 import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -43,12 +45,28 @@ def _make_non_bash_request(tool_name: str = "ls") -> MagicMock:
     return request
 
 
+def _make_file_tool_request(tool_name: str = "apply_patch", args: dict | None = None) -> MagicMock:
+    request = MagicMock()
+    request.tool_call = {"name": tool_name, "id": "call-789", "args": args or {}}
+    request.runtime = SimpleNamespace(context={"thread_id": "thread-1"}, config={}, state={})
+    return request
+
+
 def _make_handler(return_value: ToolMessage | None = None):
     """Sync handler that records calls."""
     if return_value is None:
         return_value = ToolMessage(content="ok", tool_call_id="call-123", name="bash")
     handler = MagicMock(return_value=return_value)
     return handler
+
+
+def _audit_payloads(caplog):
+    payloads = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if message.startswith("[SandboxAudit] {"):
+            payloads.append(json.loads(message.removeprefix("[SandboxAudit] ")))
+    return payloads
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +393,62 @@ class TestSandboxAuditMiddlewareWrapToolCall:
             result = self.mw.wrap_tool_call(request, handler)
         assert handler.called
         assert result == handler.return_value
+
+    def test_file_write_tool_is_audited_and_passes_through(self):
+        request = _make_file_tool_request(
+            "apply_patch",
+            {"patch_text": "*** Begin Patch\n*** Add File: a.py\n+x\n*** End Patch\n"},
+        )
+        handler = _make_handler()
+        with patch.object(self.mw, "_write_file_audit") as mock_audit:
+            result = self.mw.wrap_tool_call(request, handler)
+        assert handler.called
+        assert result == handler.return_value
+        mock_audit.assert_called_once()
+
+    def test_apply_patch_audit_records_paths_and_operation_counts(self, caplog):
+        request = _make_file_tool_request(
+            "apply_patch",
+            {
+                "patch_text": """*** Begin Patch
+*** Add File: added.py
++new
+*** Update File: app.py
+*** Move to: moved.py
+@@
+-old
++new
+*** Delete File: gone.py
+*** End Patch
+"""
+            },
+        )
+        handler = _make_handler()
+
+        with caplog.at_level(logging.INFO, logger="deerflow.agents.middlewares.sandbox_audit_middleware"):
+            result = self.mw.wrap_tool_call(request, handler)
+
+        assert handler.called
+        assert result == handler.return_value
+        payload = _audit_payloads(caplog)[-1]
+        assert payload["tool"] == "apply_patch"
+        assert payload["operation_counts"] == {"added": 1, "updated": 1, "deleted": 1, "moved": 1}
+        assert payload["paths"] == ["added.py", "app.py", "gone.py", "moved.py"]
+        assert payload["patch_chars"] == len(request.tool_call["args"]["patch_text"])
+
+    def test_apply_patch_audit_parse_error_does_not_block_handler(self, caplog):
+        request = _make_file_tool_request("apply_patch", {"patch_text": "not a patch"})
+        handler = _make_handler()
+
+        with caplog.at_level(logging.INFO, logger="deerflow.agents.middlewares.sandbox_audit_middleware"):
+            result = self.mw.wrap_tool_call(request, handler)
+
+        assert handler.called
+        assert result == handler.return_value
+        payload = _audit_payloads(caplog)[-1]
+        assert payload["tool"] == "apply_patch"
+        assert payload["paths"] == []
+        assert "patch_parse_error" in payload
 
     # --- High-risk: handler must NOT be called ---
 

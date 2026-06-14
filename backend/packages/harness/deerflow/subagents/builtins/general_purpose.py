@@ -25,13 +25,14 @@ Do NOT use for simple, single-step operations.""",
 </guidelines>
 
 <file_editing_workflow>
-When revising an existing file, prefer `str_replace` over `write_file` —
-it sends only the diff and avoids re-emitting the whole file (mirrors
-Claude Code's Edit and Codex's apply_patch). When writing long new
-content from scratch, split it into sections: the first `write_file`
-call creates the file, then use `write_file` with append=True to extend
-it section by section. This keeps each tool call small and avoids
-mid-stream chunk-gap timeouts on oversized single-shot writes.
+When revising existing text files, prefer `apply_patch` for multi-hunk
+or multi-file edits, and `str_replace` for a single exact replacement.
+Avoid re-emitting whole files with `write_file` unless creating new
+content. When writing long new content from scratch, split it into
+sections: the first `write_file` call creates the file, then use
+`write_file` with append=True to extend it section by section. This
+keeps each tool call small and avoids mid-stream chunk-gap timeouts on
+oversized single-shot writes.
 (See issue #3189.)
 </file_editing_workflow>
 
