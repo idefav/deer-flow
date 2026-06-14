@@ -123,6 +123,11 @@ def test_apply_patch_updates_adds_deletes_and_overwrites_existing_file(non_local
 def test_file_tool_descriptions_steer_large_html_edits() -> None:
     assert "HTML" in apply_patch_tool.description
     assert "large files" in apply_patch_tool.description
+    assert "Default choice for editing existing text files" in apply_patch_tool.description
+    assert "Read the target file first" in apply_patch_tool.description
+    assert "*** Update File:" in apply_patch_tool.description
+    assert "@@ " in apply_patch_tool.description
+    assert "Do not use this tool for binary files" in apply_patch_tool.description
     assert "single exact replacement" in str_replace_tool.description
     assert "large HTML" in write_file_tool.description
     assert "final response" in write_file_tool.description

@@ -395,6 +395,8 @@ def test_system_prompt_template_contains_file_editing_workflow_rule():
     # Behavioural anchors — if either of these disappears, the model will
     # silently regress to single-shot write_file calls for long content.
     assert "apply_patch" in template
+    assert "Default to `apply_patch`" in template
+    assert "Prefer `apply_patch` over `write_file`" in template
     assert "str_replace" in template
     assert "append=True" in template
     assert "HTML" in template

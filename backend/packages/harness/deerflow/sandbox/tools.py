@@ -1887,6 +1887,38 @@ file_info_tool.coroutine = _file_info_tool_async
 @tool("apply_patch", parse_docstring=True)
 def apply_patch_tool(runtime: Runtime, description: str, patch_text: str) -> str:
     """Apply a Codex-style patch to one or more text files, including HTML and large files that should be edited incrementally.
+    Default choice for editing existing text files. Use this before `write_file`
+    for source code, configuration, Markdown, reports, and HTML changes.
+
+    Use `apply_patch` when:
+    - You are modifying an existing text file.
+    - You need multi-hunk or multi-file edits in one focused change.
+    - You need to add, delete, update, or move text files with exact diffs.
+    - You want to avoid re-emitting a whole file through `write_file`.
+
+    Workflow:
+    1. Read the target file first so the patch uses exact context.
+    2. Keep the patch focused and include enough unchanged context lines.
+    3. Use one `*** Update File:` block per existing file.
+    4. Use `*** Add File:` for new small text files and `*** Delete File:` to remove files.
+    5. For long new artifacts, create them with `write_file` and append=True chunks instead.
+
+    Patch format:
+    ```
+    *** Begin Patch
+    *** Update File: path/to/file.ext
+    @@ optional context
+    -old line
+    +new line
+    *** Add File: path/to/new-file.ext
+    +new content
+    *** Delete File: path/to/old-file.ext
+    *** End Patch
+    ```
+
+    Do not use this tool for binary files. Use `str_replace` only for a single
+    exact replacement. Use `write_file` only for new content or long append-only
+    artifacts that are not practical as a patch.
 
     Args:
         description: Explain why you are applying this patch in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
@@ -2133,10 +2165,10 @@ def write_file_tool(
     use ONE of these strategies (write_file rejects oversized payloads with an
     actionable error):
 
-      1. INCREMENTAL EDIT (preferred for revisions): after the initial write,
-         use `str_replace` to surgically update sections. This is the same
-         pattern Claude Code's Write+Edit and OpenAI Codex's apply_patch use,
-         and keeps each tool call's payload small.
+      1. INCREMENTAL EDIT (preferred for revisions): use `apply_patch` for
+         existing text files, or `str_replace` only for a single exact
+         replacement. This keeps each tool call's payload small and avoids
+         re-emitting whole files.
       2. APPEND-IN-CHUNKS (for new long-form content): split the document into
          sections, each well under 80 KB. First call uses append=False to
          create the file; subsequent calls use append=True. The 80 KB cap does
@@ -2220,6 +2252,8 @@ def str_replace_tool(
     replace_all: bool = False,
 ) -> str:
     """Replace a substring in a file with another substring for a single exact replacement.
+    Prefer `apply_patch` for most file modifications, especially multi-hunk,
+    multi-file, HTML, Markdown, source code, or config edits.
     If `replace_all` is False (default), the substring to replace must appear **exactly once** in the file.
 
     Args:

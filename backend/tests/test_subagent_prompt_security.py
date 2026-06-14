@@ -77,6 +77,8 @@ def test_general_purpose_subagent_prompt_contains_large_file_editing_guidance() 
 
     assert "HTML" in prompt
     assert "large files" in prompt
+    assert "Default to `apply_patch`" in prompt
+    assert "Prefer `apply_patch` over `write_file`" in prompt
     assert "`rg`" in prompt
     assert "`rg --files`" in prompt
     assert "append=True" in prompt

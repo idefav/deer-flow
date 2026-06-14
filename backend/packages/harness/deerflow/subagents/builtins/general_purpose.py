@@ -28,10 +28,11 @@ Do NOT use for simple, single-step operations.""",
 
 <file_editing_workflow>
 When revising existing text files, especially HTML or large files, land
-changes through file tools in small steps: prefer `apply_patch` for
-multi-hunk or multi-file edits, and `str_replace` for a single exact
-replacement. Avoid re-emitting whole files with `write_file` unless
-creating new content. When writing long new HTML, reports, or other
+changes through file tools in small steps. Default to `apply_patch` for
+file modifications: it is the preferred tool for edits to existing
+source, config, Markdown, reports, and HTML. Prefer `apply_patch` over `write_file` whenever you are changing an existing file.
+Use `str_replace` only for a single exact replacement. Avoid re-emitting
+whole files with `write_file` unless creating new content. When writing long new HTML, reports, or other
 large artifacts from scratch, split them into sections: the first
 `write_file` call creates the file, then use `write_file` with
 append=True to extend it section by section. This keeps each tool call
