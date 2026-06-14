@@ -397,6 +397,15 @@ def test_system_prompt_template_contains_file_editing_workflow_rule():
     assert "apply_patch" in template
     assert "str_replace" in template
     assert "append=True" in template
+    assert "HTML" in template
+    assert "large files" in template
+    assert "`rg`" in template
+    assert "`rg --files`" in template
+    assert "scripts or formatters" in template
+    assert "Do not overwrite or revert user changes" in template
+    assert "unexpected user changes" in template
+    assert "Final Response Budget" in template
+    assert "Do not paste full HTML" in template
 
 
 def test_system_prompt_template_preserves_placeholders():

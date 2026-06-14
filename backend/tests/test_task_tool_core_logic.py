@@ -79,6 +79,16 @@ def _run_task_tool(**kwargs) -> str:
     return task_tool_module.task_tool.func(**kwargs)
 
 
+def test_task_tool_description_contains_dispatch_contract() -> None:
+    description = task_tool_module.task_tool.description
+
+    assert "2+ independent, parallelizable sub-tasks" in description
+    assert "self-contained prompt" in description
+    assert "description: short display label" in description
+    assert "Simple, single-step operations" in description
+    assert "Tasks requiring user interaction or clarification" in description
+
+
 async def _no_sleep(_: float) -> None:
     return None
 

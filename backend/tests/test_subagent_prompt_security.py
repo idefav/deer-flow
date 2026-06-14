@@ -43,6 +43,19 @@ def test_build_subagent_section_includes_bash_when_available(monkeypatch) -> Non
     assert "available tools (bash, ls, read_file, web_search, etc.)" in section
 
 
+def test_build_subagent_section_contains_codex_style_dispatch_rules(monkeypatch) -> None:
+    monkeypatch.setattr(prompt_module, "get_available_subagent_names", lambda: ["general-purpose"])
+
+    section = prompt_module._build_subagent_section(3)
+
+    assert "2+ independent, parallelizable sub-tasks" in section
+    assert "Use direct tools for simple, single-step work" in section
+    assert "self-contained" in section
+    assert "objective, files or paths to inspect, constraints, and expected output" in section
+    assert "Do not wrap a single operation" in section
+    assert "at most 3 `task` calls" in section
+
+
 def test_bash_subagent_prompt_mentions_workspace_relative_paths() -> None:
     from deerflow.subagents.builtins.bash_agent import BASH_AGENT_CONFIG
 
@@ -55,3 +68,18 @@ def test_general_purpose_subagent_prompt_mentions_workspace_relative_paths() -> 
 
     assert "Treat `/mnt/user-data/workspace` as the default working directory for coding and file IO" in GENERAL_PURPOSE_CONFIG.system_prompt
     assert "`hello.txt`, `../uploads/input.csv`, and `../outputs/result.md`" in GENERAL_PURPOSE_CONFIG.system_prompt
+
+
+def test_general_purpose_subagent_prompt_contains_large_file_editing_guidance() -> None:
+    from deerflow.subagents.builtins.general_purpose import GENERAL_PURPOSE_CONFIG
+
+    prompt = GENERAL_PURPOSE_CONFIG.system_prompt
+
+    assert "HTML" in prompt
+    assert "large files" in prompt
+    assert "`rg`" in prompt
+    assert "`rg --files`" in prompt
+    assert "append=True" in prompt
+    assert "Do not overwrite or revert user changes" in prompt
+    assert "final response" in prompt
+    assert "Do not paste full HTML" in prompt

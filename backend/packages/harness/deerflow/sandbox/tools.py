@@ -1886,7 +1886,7 @@ file_info_tool.coroutine = _file_info_tool_async
 
 @tool("apply_patch", parse_docstring=True)
 def apply_patch_tool(runtime: Runtime, description: str, patch_text: str) -> str:
-    """Apply a Codex-style patch to one or more text files.
+    """Apply a Codex-style patch to one or more text files, including HTML and large files that should be edited incrementally.
 
     Args:
         description: Explain why you are applying this patch in short words. ALWAYS PROVIDE THIS PARAMETER FIRST.
@@ -2122,7 +2122,8 @@ def write_file_tool(
     content: str,
     append: bool = False,
 ) -> str:
-    """Write text content to a file. By default this overwrites the target file; set append=True to add content to the end without replacing existing content.
+    """Write text content to a file. For large HTML or long artifacts, write content to files in chunks and summarize paths in the final response instead of pasting full content there.
+    By default this overwrites the target file; set append=True to add content to the end without replacing existing content.
 
     SIZE POLICY (issue #3189):
     A single non-append write_file call must not exceed 80 KB of UTF-8 content.
@@ -2160,8 +2161,10 @@ def write_file_tool(
                     f"{max_bytes}-byte single-call limit. Split the content into smaller "
                     "pieces: either (a) write the first section now, then use `str_replace` "
                     "for further edits, or (b) call write_file again with append=True "
-                    "carrying the next section. See SIZE POLICY in the tool docstring "
-                    "or issue #3189 for the rationale."
+                    "carrying the next section. For large HTML or generated artifacts, "
+                    "persist content with chunked file writes and keep the final response "
+                    "to a short summary plus file paths. See SIZE POLICY in the tool "
+                    "docstring or issue #3189 for the rationale."
                 )
     try:
         requested_path = path
@@ -2216,7 +2219,7 @@ def str_replace_tool(
     new_str: str,
     replace_all: bool = False,
 ) -> str:
-    """Replace a substring in a file with another substring.
+    """Replace a substring in a file with another substring for a single exact replacement.
     If `replace_all` is False (default), the substring to replace must appear **exactly once** in the file.
 
     Args:

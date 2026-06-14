@@ -16,6 +16,8 @@ from deerflow.sandbox.tools import (
     mkdir_tool,
     move_file_tool,
     remove_file_tool,
+    str_replace_tool,
+    write_file_tool,
 )
 
 
@@ -116,6 +118,14 @@ def test_apply_patch_updates_adds_deletes_and_overwrites_existing_file(non_local
     assert non_local_sandbox.files["/mnt/user-data/workspace/app.py"] == "def value():\n    return 2\n"
     assert non_local_sandbox.files["/mnt/user-data/workspace/existing.txt"] == "new content\n"
     assert "/mnt/user-data/workspace/old.txt" not in non_local_sandbox.files
+
+
+def test_file_tool_descriptions_steer_large_html_edits() -> None:
+    assert "HTML" in apply_patch_tool.description
+    assert "large files" in apply_patch_tool.description
+    assert "single exact replacement" in str_replace_tool.description
+    assert "large HTML" in write_file_tool.description
+    assert "final response" in write_file_tool.description
 
 
 def test_apply_patch_maps_relative_paths_to_workspace(monkeypatch) -> None:

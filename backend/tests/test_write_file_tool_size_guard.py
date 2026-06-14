@@ -70,6 +70,8 @@ def test_above_cap_returns_actionable_error():
     assert "81920 bytes" in result or "82944 bytes" in result, "Error must report the actual content size so the LLM/operator can judge how much to trim or chunk."
     assert "str_replace" in result, "Error must point to str_replace as the preferred incremental-edit path."
     assert "append=True" in result, "Error must also surface the append-in-chunks alternative."
+    assert "large HTML" in result, "Error must steer large HTML/artifact payloads toward chunked file writes."
+    assert "final response" in result, "Error must tell the model not to deliver large content in the final reply."
 
 
 def test_above_cap_with_append_true_bypasses_guard():

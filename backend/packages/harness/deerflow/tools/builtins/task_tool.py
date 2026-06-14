@@ -193,10 +193,15 @@ async def task_tool(
 ) -> str:
     """Delegate a task to a specialized subagent that runs in its own context.
 
-    Subagents help you:
-    - Preserve context by keeping exploration and implementation separate
-    - Handle complex multi-step tasks autonomously
-    - Execute commands or operations in isolated contexts
+    Use this tool only when delegation adds value:
+    - 2+ independent, parallelizable sub-tasks can run at the same time
+    - A focused investigation would produce verbose output or benefit from isolated context
+    - You need parallel research, multi-area code inspection, or an independent validation pass
+
+    Each task must use a self-contained prompt. Include the objective, files or
+    paths to inspect, constraints, and expected output. Do not assume the
+    subagent can see unstated parent context, hidden thinking, or previous tool
+    results.
 
     Built-in subagent types:
     - **general-purpose**: A capable agent for complex, multi-step tasks that require
@@ -211,15 +216,15 @@ async def task_tool(
     tools, skills, model, and timeout configuration. If an unknown subagent_type
     is provided, the error message will list all available types.
 
-    When to use this tool:
-    - Complex tasks requiring multiple steps or tools
-    - Tasks that produce verbose output
-    - When you want to isolate context from the main conversation
-    - Parallel research or exploration tasks
+    Parameter contract:
+    - description: short display label for logging/display; keep it 3-5 words
+    - prompt: self-contained prompt with all details the subagent needs
+    - subagent_type: available subagent type such as `general-purpose` or `bash`
 
     When NOT to use this tool:
     - Simple, single-step operations (use tools directly)
     - Tasks requiring user interaction or clarification
+    - Strictly sequential work where each step depends on the previous result
 
     Args:
         description: A short (3-5 word) description of the task for logging/display. ALWAYS PROVIDE THIS PARAMETER FIRST.
