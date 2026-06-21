@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+import yaml
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -1491,6 +1492,53 @@ def test_mcp_stateless_gate_rejects_enabled_stdio_without_runtime_mode(tmp_path)
             "runtime_mode": "remote",
         },
     ]
+
+
+def test_runtime_object_storage_gate_rejects_filesystem_runtime(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"runtime_storage": {"backend": "filesystem"}}),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(["runtime_object_storage"], env={}, project_root=tmp_path)
+
+    assert report["ok"] is False
+    gate = report["gates"][0]
+    assert gate["ready_to_invoke"] is False
+    assert gate["config_issues"] == [
+        "config.yaml runtime_storage.backend must be 'object' for runtime PVC removal",
+        "config.yaml runtime_storage.object_store is required when backend is object",
+        "provisioner RUNTIME_STORAGE_BACKEND must be 'object' for runtime PVC removal",
+    ]
+    assert gate["checked_env"] == ["RUNTIME_STORAGE_BACKEND", "USERDATA_PVC_NAME"]
+
+
+def test_runtime_object_storage_gate_accepts_object_runtime(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {
+                        "endpoint_url": "http://seaweedfs:8333",
+                        "bucket": "deerflow-runtime",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(
+        ["runtime_object_storage"],
+        env={"RUNTIME_STORAGE_BACKEND": "object"},
+        project_root=tmp_path,
+    )
+
+    assert report["ok"] is True
+    gate = report["gates"][0]
+    assert gate["ready_to_invoke"] is True
+    assert gate["config_issues"] == []
 
 
 def test_mcp_stateless_gate_accepts_http_and_explicitly_tagged_stdio(tmp_path):

@@ -10,6 +10,8 @@ from starlette.requests import Request
 from starlette.responses import FileResponse
 
 import app.gateway.routers.artifacts as artifacts_router
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
 
 ACTIVE_ARTIFACT_CASES = [
     ("poc.html", "<html><body><script>alert('xss')</script></body></html>"),
@@ -20,6 +22,18 @@ ACTIVE_ARTIFACT_CASES = [
 
 def _make_request(query_string: bytes = b"") -> Request:
     return Request({"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": query_string})
+
+
+def _object_storage_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
 
 
 def test_get_artifact_reads_utf8_text_file_on_windows_locale(tmp_path, monkeypatch) -> None:
@@ -41,6 +55,45 @@ def test_get_artifact_reads_utf8_text_file_on_windows_locale(tmp_path, monkeypat
 
     assert bytes(response.body).decode("utf-8") == text
     assert response.media_type == "text/plain"
+
+
+def test_get_artifact_object_mode_reads_text_from_artifact_store(monkeypatch) -> None:
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/outputs/note.txt", b"hello object", content_type="text/plain")
+    monkeypatch.setattr(artifacts_router, "make_artifact_store", lambda _config: store)
+    monkeypatch.setattr(artifacts_router, "get_effective_user_id", lambda: "user-1")
+
+    response = asyncio.run(
+        call_unwrapped(
+            artifacts_router.get_artifact,
+            "thread-1",
+            "mnt/user-data/outputs/note.txt",
+            _make_request(),
+            config=_object_storage_config(),
+        )
+    )
+
+    assert bytes(response.body).decode("utf-8") == "hello object"
+    assert response.media_type == "text/plain"
+
+
+def test_get_artifact_object_mode_returns_404_for_missing_object(monkeypatch) -> None:
+    store = InMemoryArtifactStore(prefix="deerflow")
+    monkeypatch.setattr(artifacts_router, "make_artifact_store", lambda _config: store)
+    monkeypatch.setattr(artifacts_router, "get_effective_user_id", lambda: "user-1")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            call_unwrapped(
+                artifacts_router.get_artifact,
+                "thread-1",
+                "mnt/user-data/outputs/missing.txt",
+                _make_request(),
+                config=_object_storage_config(),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 @pytest.mark.parametrize(("filename", "content"), ACTIVE_ARTIFACT_CASES)

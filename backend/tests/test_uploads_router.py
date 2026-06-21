@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 
 from app.gateway.deps import get_config
 from app.gateway.routers import uploads
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
 
 
 class ChunkedUpload:
@@ -34,6 +36,18 @@ def _mounted_provider() -> MagicMock:
     provider = MagicMock()
     provider.uses_thread_data_mounts = True
     return provider
+
+
+def _object_storage_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
 
 
 def test_upload_files_writes_thread_storage_and_skips_local_sandbox_sync(tmp_path):
@@ -88,6 +102,64 @@ def test_upload_openapi_schema_exposes_file_size_as_integer():
 
     assert upload_schema["$defs"]["UploadedFileInfo"]["properties"]["size"]["type"] == "integer"
     assert list_schema["$defs"]["UploadedFileInfo"]["properties"]["size"]["type"] == "integer"
+
+
+def test_upload_files_object_mode_writes_uploads_to_artifact_store(tmp_path):
+    store = InMemoryArtifactStore(prefix="deerflow")
+    cfg = _object_storage_config()
+
+    with (
+        patch.object(uploads, "make_artifact_store", return_value=store),
+        patch.object(uploads, "ensure_uploads_dir", side_effect=AssertionError("object mode must not create thread upload dirs")),
+        patch.object(uploads, "get_sandbox_provider", side_effect=AssertionError("object mode upload must not acquire sandbox")),
+        patch.object(uploads, "get_effective_user_id", return_value="user-1"),
+    ):
+        file = UploadFile(filename="notes.txt", file=BytesIO(b"hello object uploads"))
+        result = asyncio.run(call_unwrapped(uploads.upload_files, "thread-object", request=MagicMock(), files=[file], config=cfg))
+
+    assert result.success is True
+    assert result.files[0].filename == "notes.txt"
+    assert result.files[0].size == len(b"hello object uploads")
+    assert result.files[0].path == "/mnt/user-data/uploads/notes.txt"
+    assert result.files[0].virtual_path == "/mnt/user-data/uploads/notes.txt"
+    assert store.get_bytes("user-1", "thread-object", "/mnt/user-data/uploads/notes.txt") == b"hello object uploads"
+    assert not tmp_path.joinpath("uploads").exists()
+
+
+def test_list_uploaded_files_object_mode_reads_from_artifact_store():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    cfg = _object_storage_config()
+    store.put_bytes("user-1", "thread-object", "/mnt/user-data/uploads/a.txt", b"a")
+    store.put_bytes("user-1", "thread-object", "/mnt/user-data/uploads/b.csv", b"bb")
+    store.put_bytes("other-user", "thread-object", "/mnt/user-data/uploads/hidden.txt", b"hidden")
+
+    with (
+        patch.object(uploads, "make_artifact_store", return_value=store),
+        patch.object(uploads, "get_uploads_dir", side_effect=AssertionError("object mode must not inspect local upload dirs")),
+        patch.object(uploads, "get_effective_user_id", return_value="user-1"),
+    ):
+        result = asyncio.run(call_unwrapped(uploads.list_uploaded_files, "thread-object", request=MagicMock(), config=cfg))
+
+    assert result.count == 2
+    assert [item.filename for item in result.files] == ["a.txt", "b.csv"]
+    assert [item.path for item in result.files] == ["/mnt/user-data/uploads/a.txt", "/mnt/user-data/uploads/b.csv"]
+
+
+def test_delete_uploaded_file_object_mode_deletes_from_artifact_store():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    cfg = _object_storage_config()
+    store.put_bytes("user-1", "thread-object", "/mnt/user-data/uploads/a.txt", b"a")
+
+    with (
+        patch.object(uploads, "make_artifact_store", return_value=store),
+        patch.object(uploads, "get_uploads_dir", side_effect=AssertionError("object mode must not inspect local upload dirs")),
+        patch.object(uploads, "get_effective_user_id", return_value="user-1"),
+    ):
+        result = asyncio.run(call_unwrapped(uploads.delete_uploaded_file, "thread-object", "a.txt", request=MagicMock(), config=cfg))
+
+    assert result == {"success": True, "message": "Deleted a.txt"}
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-object", "/mnt/user-data/uploads/a.txt")
 
 
 def test_upload_files_auto_renames_duplicate_form_filenames(tmp_path):

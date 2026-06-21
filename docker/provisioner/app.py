@@ -64,11 +64,14 @@ SKILLS_HOST_PATH = os.environ.get("SKILLS_HOST_PATH", "/skills")
 THREADS_HOST_PATH = os.environ.get("THREADS_HOST_PATH", "/.deer-flow/threads")
 SKILLS_PVC_NAME = os.environ.get("SKILLS_PVC_NAME", "")
 USERDATA_PVC_NAME = os.environ.get("USERDATA_PVC_NAME", "")
+RUNTIME_STORAGE_BACKEND = os.environ.get("RUNTIME_STORAGE_BACKEND", "filesystem").strip().lower()
 SAFE_THREAD_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 SAFE_USER_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 DEFAULT_USER_ID = "default"
 MOUNT_CONTRACT_HASH_ANNOTATION = "deerflow.io/mount-contract-hash"
 MOUNT_CONTRACT_PATHS_ANNOTATION = "deerflow.io/mount-contract-paths"
+_SUPPORTED_RUNTIME_STORAGE_BACKENDS = {"filesystem", "object"}
+_OBJECT_RUNTIME_FORBIDDEN_MOUNTS = ("/mnt/user-data", "/mnt/acp-workspace")
 
 # Path to the kubeconfig *inside* the provisioner container.
 # Typically the host's ~/.kube/config is mounted here.
@@ -258,14 +261,38 @@ def _extra_mount_volume_name(index: int) -> str:
     return f"extra-mount-{index}"
 
 
+def _runtime_storage_object_mode() -> bool:
+    return RUNTIME_STORAGE_BACKEND == "object"
+
+
+def _is_forbidden_object_runtime_mount(container_path: str) -> bool:
+    normalized = container_path.rstrip("/")
+    return any(normalized == prefix or normalized.startswith(f"{prefix}/") for prefix in _OBJECT_RUNTIME_FORBIDDEN_MOUNTS)
+
+
+def _validate_runtime_storage_config(extra_mounts: list[ExtraMount] | None = None) -> None:
+    if RUNTIME_STORAGE_BACKEND not in _SUPPORTED_RUNTIME_STORAGE_BACKENDS:
+        raise RuntimeError(f"Unsupported RUNTIME_STORAGE_BACKEND={RUNTIME_STORAGE_BACKEND!r}; expected one of {_SUPPORTED_RUNTIME_STORAGE_BACKENDS}")
+    if not _runtime_storage_object_mode():
+        return
+    if USERDATA_PVC_NAME:
+        raise RuntimeError("RUNTIME_STORAGE_BACKEND=object forbids USERDATA_PVC_NAME; runtime files must use object storage")
+    for mount in extra_mounts or []:
+        if _is_forbidden_object_runtime_mount(mount.container_path):
+            raise RuntimeError(f"RUNTIME_STORAGE_BACKEND=object forbids extra mount at {mount.container_path}")
+
+
 def _mount_contract_payload(extra_mounts: list[ExtraMount] | None = None) -> list[dict[str, object]]:
     return [
-        {
-            "host_path": mount.host_path,
-            "container_path": mount.container_path,
-            "read_only": mount.read_only,
-        }
-        for mount in extra_mounts or []
+        {"runtime_storage_backend": RUNTIME_STORAGE_BACKEND},
+        *[
+            {
+                "host_path": mount.host_path,
+                "container_path": mount.container_path,
+                "read_only": mount.read_only,
+            }
+            for mount in extra_mounts or []
+        ],
     ]
 
 
@@ -298,7 +325,7 @@ def _ensure_existing_mount_contract(sandbox_id: str, extra_mounts: list[ExtraMou
             detail=f"Failed to read existing sandbox Pod mount contract: {exc.reason}",
         ) from exc
 
-    if actual_hash is None and not extra_mounts:
+    if actual_hash is None and not extra_mounts and not _runtime_storage_object_mode():
         return
     if actual_hash == expected_hash:
         return
@@ -314,6 +341,7 @@ def _ensure_existing_mount_contract(sandbox_id: str, extra_mounts: list[ExtraMou
 
 def _build_default_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
     """Build volume list: PVC when configured, otherwise hostPath."""
+    _validate_runtime_storage_config()
     if SKILLS_PVC_NAME:
         skills_vol = k8s_client.V1Volume(
             name="skills",
@@ -330,6 +358,9 @@ def _build_default_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
                 type="Directory",
             ),
         )
+
+    if _runtime_storage_object_mode():
+        return [skills_vol]
 
     if USERDATA_PVC_NAME:
         userdata_vol = k8s_client.V1Volume(
@@ -353,6 +384,7 @@ def _build_default_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
 def _build_volumes(thread_id: str, extra_mounts: list[ExtraMount] | None = None) -> list[k8s_client.V1Volume]:
     """Build volume list and allow request-scoped extra mounts to override paths."""
     extra_mounts = extra_mounts or []
+    _validate_runtime_storage_config(extra_mounts)
     extra_container_paths = {mount.container_path for mount in extra_mounts}
     volumes = [
         volume
@@ -377,6 +409,15 @@ def _build_volumes(thread_id: str, extra_mounts: list[ExtraMount] | None = None)
 
 def _build_default_volume_mounts(thread_id: str, user_id: str = DEFAULT_USER_ID) -> list[k8s_client.V1VolumeMount]:
     """Build volume mount list, using subPath for PVC user-data."""
+    _validate_runtime_storage_config()
+    skills_mount = k8s_client.V1VolumeMount(
+        name="skills",
+        mount_path="/mnt/skills",
+        read_only=True,
+    )
+    if _runtime_storage_object_mode():
+        return [skills_mount]
+
     userdata_mount = k8s_client.V1VolumeMount(
         name="user-data",
         mount_path="/mnt/user-data",
@@ -385,14 +426,7 @@ def _build_default_volume_mounts(thread_id: str, user_id: str = DEFAULT_USER_ID)
     if USERDATA_PVC_NAME:
         userdata_mount.sub_path = f"deer-flow/users/{user_id}/threads/{thread_id}/user-data"
 
-    return [
-        k8s_client.V1VolumeMount(
-            name="skills",
-            mount_path="/mnt/skills",
-            read_only=True,
-        ),
-        userdata_mount,
-    ]
+    return [skills_mount, userdata_mount]
 
 
 def _build_volume_mounts(
@@ -402,6 +436,7 @@ def _build_volume_mounts(
 ) -> list[k8s_client.V1VolumeMount]:
     """Build volume mounts and allow request-scoped extra mounts to override paths."""
     extra_mounts = extra_mounts or []
+    _validate_runtime_storage_config(extra_mounts)
     extra_container_paths = {mount.container_path for mount in extra_mounts}
     mounts = [
         mount

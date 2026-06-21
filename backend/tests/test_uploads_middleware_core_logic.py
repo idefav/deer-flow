@@ -12,8 +12,12 @@ from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+import deerflow.agents.middlewares.uploads_middleware as uploads_middleware_module
 from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import Paths
+from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY
 
 THREAD_ID = "thread-abc123"
@@ -26,6 +30,22 @@ THREAD_ID = "thread-abc123"
 
 def _middleware(tmp_path: Path) -> UploadsMiddleware:
     return UploadsMiddleware(base_dir=str(tmp_path))
+
+
+def _object_runtime_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "endpoint_url": "http://seaweedfs:8333",
+                    "bucket": "deerflow-runtime",
+                },
+            },
+        }
+    )
 
 
 def _runtime(thread_id: str | None = THREAD_ID) -> MagicMock:
@@ -520,3 +540,35 @@ class TestBeforeAgent:
         content = result["messages"][-1].content
         assert "Document outline" not in content
         assert "grep" in content
+
+    def test_object_runtime_reads_uploads_from_artifact_store_without_disk(self, tmp_path, monkeypatch):
+        store = InMemoryArtifactStore(prefix="deerflow")
+        user_id = get_effective_user_id()
+        store.put_bytes(user_id, THREAD_ID, "/mnt/user-data/uploads/new.txt", b"new")
+        store.put_bytes(user_id, THREAD_ID, "/mnt/user-data/uploads/old.txt", b"old")
+        mw = _middleware(tmp_path)
+        monkeypatch.setattr(uploads_middleware_module, "get_app_config", lambda: _object_runtime_config(), raising=False)
+        monkeypatch.setattr(uploads_middleware_module, "make_artifact_store", lambda _config: store, raising=False)
+        monkeypatch.setattr(
+            mw._paths,
+            "sandbox_uploads_dir",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("object mode must not read upload disk path")),
+        )
+
+        msg = _human("compare files", files=[{"filename": "new.txt", "size": 3, "path": "/mnt/user-data/uploads/new.txt"}])
+        result = mw.before_agent(self._state(msg), _runtime())
+
+        assert result is not None
+        content = result["messages"][-1].content
+        assert "new.txt" in content
+        assert "old.txt" in content
+        assert result["uploaded_files"] == [
+            {
+                "filename": "new.txt",
+                "size": 3,
+                "path": "/mnt/user-data/uploads/new.txt",
+                "extension": ".txt",
+                "outline": [],
+                "outline_preview": [],
+            }
+        ]

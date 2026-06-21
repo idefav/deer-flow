@@ -1,7 +1,9 @@
 import asyncio
 import json
 import tempfile
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +18,8 @@ from app.channels.message_bus import (
     OutboundMessage,
 )
 from app.channels.store import ChannelStore
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
 
 
 def _pending(
@@ -41,6 +45,56 @@ def _run(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+def _object_runtime_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "endpoint_url": "http://seaweedfs:8333",
+                    "bucket": "deerflow-runtime",
+                },
+            },
+        }
+    )
+
+
+class _FakeMessageResourceRequest:
+    @classmethod
+    def builder(cls):
+        return cls()
+
+    def message_id(self, value):
+        self.message_id_value = value
+        return self
+
+    def file_key(self, value):
+        self.file_key_value = value
+        return self
+
+    def type(self, value):
+        self.type_value = value
+        return self
+
+    def build(self):
+        return self
+
+
+class _FakeFeishuResourceResponse:
+    file_name = "report.txt"
+    file = BytesIO(b"feishu object")
+    code = 0
+    msg = "ok"
+
+    def success(self):
+        return True
+
+    def get_log_id(self):
+        return "log-1"
 
 
 def test_feishu_on_message_plain_text():
@@ -150,6 +204,33 @@ def test_feishu_receive_file_replaces_placeholders_in_order():
         result = await channel.receive_file(msg, "thread_1")
 
         assert result.text == "before /mnt/user-data/uploads/a.png middle /mnt/user-data/uploads/b.pdf after"
+
+    _run(go())
+
+
+def test_feishu_receive_single_file_object_runtime_writes_artifact_store(monkeypatch):
+    async def go():
+        store = InMemoryArtifactStore(prefix="deerflow")
+        bus = MessageBus()
+        channel = FeishuChannel(bus, {"app_id": "test", "app_secret": "test"})
+        channel._GetMessageResourceRequest = _FakeMessageResourceRequest
+        response = _FakeFeishuResourceResponse()
+        channel._api_client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message_resource=SimpleNamespace(get=lambda _request: response),
+                )
+            )
+        )
+        monkeypatch.setattr("app.channels.feishu.get_app_config", lambda: _object_runtime_config(), raising=False)
+        monkeypatch.setattr("app.channels.feishu.make_artifact_store", lambda _config: store, raising=False)
+        monkeypatch.setattr("app.channels.feishu.get_paths", lambda: (_ for _ in ()).throw(AssertionError("object mode must not write local uploads")), raising=False)
+        monkeypatch.setattr("app.channels.feishu.get_sandbox_provider", lambda: (_ for _ in ()).throw(AssertionError("object mode must not sync file through sandbox")), raising=False)
+
+        virtual_path = await channel._receive_single_file("msg-1", "file-key", "file", "thread-feishu", user_id="owner-1")
+
+        assert virtual_path == "/mnt/user-data/uploads/report.txt"
+        assert store.get_bytes("owner-1", "thread-feishu", "/mnt/user-data/uploads/report.txt") == b"feishu object"
 
     _run(go())
 

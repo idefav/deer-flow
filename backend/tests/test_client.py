@@ -17,8 +17,11 @@ from app.gateway.routers.memory import MemoryConfigResponse, MemoryStatusRespons
 from app.gateway.routers.models import ModelResponse, ModelsListResponse
 from app.gateway.routers.skills import SkillInstallResponse, SkillResponse, SkillsListResponse
 from app.gateway.routers.uploads import UploadResponse
+from deerflow.artifacts.store import InMemoryArtifactStore
 from deerflow.client import DeerFlowClient
+from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import Paths
+from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.uploads.manager import PathTraversalError
 
 # ---------------------------------------------------------------------------
@@ -51,6 +54,22 @@ def client(mock_app_config, tmp_path):
     _storage_mod._default_skill_storage = LocalSkillStorage(host_path=str(tmp_path))
     with patch("deerflow.client.get_app_config", return_value=mock_app_config):
         return DeerFlowClient()
+
+
+def _object_runtime_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "endpoint_url": "http://seaweedfs:8333",
+                    "bucket": "deerflow-runtime",
+                },
+            },
+        }
+    )
 
 
 @pytest.fixture
@@ -1689,6 +1708,29 @@ class TestUploads:
                 with pytest.raises(PathTraversalError):
                     client.delete_upload("thread-1", "../../etc/passwd")
 
+    def test_object_runtime_upload_list_delete_use_artifact_store(self, client, tmp_path):
+        store = InMemoryArtifactStore(prefix="deerflow")
+        src_file = tmp_path / "object.txt"
+        src_file.write_text("object upload")
+        with (
+            patch("deerflow.client.get_app_config", return_value=_object_runtime_config()),
+            patch("deerflow.client.make_artifact_store", return_value=store),
+            patch("deerflow.client.ensure_uploads_dir", side_effect=AssertionError("object mode must not create uploads dir")),
+        ):
+            upload_result = client.upload_files("thread-object", [src_file])
+            uploaded_bytes = store.get_bytes(get_effective_user_id(), "thread-object", "/mnt/user-data/uploads/object.txt")
+            list_result = client.list_uploads("thread-object")
+            delete_result = client.delete_upload("thread-object", "object.txt")
+            after_delete = client.list_uploads("thread-object")
+
+        assert upload_result["success"] is True
+        assert upload_result["files"][0]["path"] == "/mnt/user-data/uploads/object.txt"
+        assert uploaded_bytes == b"object upload"
+        assert list_result["count"] == 1
+        assert list_result["files"][0]["filename"] == "object.txt"
+        assert delete_result["success"] is True
+        assert after_delete["count"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Artifacts
@@ -1739,6 +1781,19 @@ class TestArtifacts:
             with patch("deerflow.client.get_paths", return_value=paths):
                 with pytest.raises(PathTraversalError):
                     client.get_artifact("t1", "mnt/user-data/../../../etc/passwd")
+
+    def test_object_runtime_get_artifact_reads_artifact_store(self, client):
+        store = InMemoryArtifactStore(prefix="deerflow")
+        store.put_bytes(get_effective_user_id(), "thread-object", "/mnt/user-data/outputs/result.txt", b"object artifact", content_type="text/plain")
+        with (
+            patch("deerflow.client.get_app_config", return_value=_object_runtime_config()),
+            patch("deerflow.client.make_artifact_store", return_value=store),
+            patch("deerflow.client.get_paths", side_effect=AssertionError("object mode must not resolve local artifact path")),
+        ):
+            content, mime = client.get_artifact("thread-object", "mnt/user-data/outputs/result.txt")
+
+        assert content == b"object artifact"
+        assert mime == "text/plain"
 
 
 # ===========================================================================

@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
+from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.tools.builtins.view_image_tool import view_image_tool
 
 view_image_module = importlib.import_module("deerflow.tools.builtins.view_image_tool")
@@ -33,6 +36,22 @@ def _make_runtime(thread_data: dict[str, str]) -> SimpleNamespace:
         state={"thread_data": thread_data},
         context={"thread_id": "thread-1"},
         config={},
+    )
+
+
+def _object_runtime_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "endpoint_url": "http://seaweedfs:8333",
+                    "bucket": "deerflow-runtime",
+                },
+            },
+        }
     )
 
 
@@ -64,6 +83,34 @@ def test_view_image_reads_virtual_uploads_path(tmp_path: Path) -> None:
         runtime=_make_runtime(thread_data),
         image_path="/mnt/user-data/uploads/sample.png",
         tool_call_id="tc-uploads",
+    )
+
+    assert _message_content(result) == "Successfully read image"
+    viewed_image = result.update["viewed_images"]["/mnt/user-data/uploads/sample.png"]
+    assert viewed_image["base64"] == base64.b64encode(PNG_BYTES).decode("utf-8")
+    assert viewed_image["mime_type"] == "image/png"
+
+
+def test_view_image_object_runtime_reads_from_artifact_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes(get_effective_user_id(), "thread-1", "/mnt/user-data/uploads/sample.png", PNG_BYTES, content_type="image/png")
+    monkeypatch.setattr(view_image_module, "get_app_config", lambda: _object_runtime_config(), raising=False)
+    monkeypatch.setattr(view_image_module, "make_artifact_store", lambda _config: store, raising=False)
+    monkeypatch.setattr(
+        "deerflow.sandbox.tools.resolve_and_validate_user_data_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("object mode must not resolve a local user-data path")),
+    )
+
+    result = view_image_tool.func(
+        runtime=_make_runtime(
+            {
+                "workspace_path": "/mnt/user-data/workspace",
+                "uploads_path": "/mnt/user-data/uploads",
+                "outputs_path": "/mnt/user-data/outputs",
+            }
+        ),
+        image_path="/mnt/user-data/uploads/sample.png",
+        tool_call_id="tc-object-image",
     )
 
     assert _message_content(result) == "Successfully read image"

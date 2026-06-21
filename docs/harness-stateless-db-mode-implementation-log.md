@@ -8422,6 +8422,554 @@ git diff --check produced no output.
 
 ---
 
+## Batch 113: Runtime Object Storage Foundation
+
+Date: 2026-06-21
+
+### Goal
+
+Start the runtime PVC removal track by introducing the configuration and artifact-addressing foundation for object-backed runtime files. This batch does not remove the PVC yet; it creates the tested contract that later gateway, sandbox materialization, preview, and migration code will use.
+
+### Steps
+
+1. Add failing tests for `runtime_storage` config parsing, object-mode validation, S3-compatible defaults, runtime object key layout, path traversal rejection, and basic ArtifactStore list/delete behavior.
+2. Add `RuntimeStorageConfig` and `ObjectStoreConfig`, then register `runtime_storage` on `AppConfig`.
+3. Register `runtime_storage` in the startup-only reload boundary because switching filesystem/object mode requires rebuilding sandbox/provider storage wiring.
+4. Add `deerflow.artifacts.store` with `ArtifactStore`, `ArtifactMetadata`, object key helpers, path validation, and an in-memory implementation for focused tests.
+5. Run the focused tests for the new foundation.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/config/runtime_storage_config.py`
+- `backend/packages/harness/deerflow/config/app_config.py`
+- `backend/packages/harness/deerflow/config/__init__.py`
+- `backend/packages/harness/deerflow/config/reload_boundary.py`
+- `backend/packages/harness/deerflow/artifacts/__init__.py`
+- `backend/packages/harness/deerflow/artifacts/store.py`
+- `backend/tests/test_runtime_storage_config.py`
+- `backend/tests/test_runtime_artifact_store.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-runtime-storage-foundation-review.md`
+
+### Verification
+
+Red checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_storage_config.py tests/test_runtime_artifact_store.py -q
+uv --directory backend run pytest tests/test_runtime_storage_config.py -q
+```
+
+Result:
+
+```text
+ERROR tests/test_runtime_artifact_store.py - ModuleNotFoundError: No module named 'deerflow.artifacts'
+3 failed, 1 warning in 0.34s
+Failures confirmed runtime_storage was not part of AppConfig and the artifact store package did not exist.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_storage_config.py tests/test_runtime_artifact_store.py -q
+uv --directory backend run pytest tests/test_runtime_storage_config.py tests/test_runtime_artifact_store.py tests/test_reload_boundary.py -q
+uv --directory backend run ruff check packages/harness/deerflow/config/runtime_storage_config.py packages/harness/deerflow/config/app_config.py packages/harness/deerflow/config/__init__.py packages/harness/deerflow/config/reload_boundary.py packages/harness/deerflow/artifacts tests/test_runtime_storage_config.py tests/test_runtime_artifact_store.py
+git diff --check
+```
+
+Result:
+
+```text
+11 passed, 1 warning in 0.24s
+21 passed, 1 warning in 0.21s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Add the S3-compatible ArtifactStore implementation and factory wiring from `RuntimeStorageConfig`.
+- Wire object-backed uploads/artifacts/present-file/view-image flows.
+- Add sandbox materialize/flush orchestration for `/mnt/user-data` and `/mnt/acp-workspace`.
+- Add provisioner strict mode that blocks `USERDATA_PVC_NAME` when `runtime_storage.backend=object`.
+- Add migration tooling from existing `.deer-flow`/runtime PVC files to object storage.
+
+---
+
+## Batch 114: S3-Compatible Runtime Artifact Store
+
+Date: 2026-06-21
+
+### Goal
+
+Add the production object-store backend behind the Batch 113 ArtifactStore contract. The implementation targets S3-compatible APIs so the runtime PVC replacement can use open-source object storage such as SeaweedFS while preserving the `/mnt/user-data` and `/mnt/acp-workspace` path contract.
+
+### Steps
+
+1. Add failing tests for `S3ArtifactStore` put/get/list/delete behavior using an injected fake S3 client.
+2. Add failing tests for `make_artifact_store()` selecting S3 object mode and returning `None` for filesystem compatibility mode.
+3. Implement `S3ArtifactStore` with deterministic object keys, content type propagation, user metadata, and an internal `deerflow-sha256` metadata field.
+4. Add lazy boto3 client construction from `ObjectStoreConfig`, including endpoint URL, region, path-style addressing, TLS verification, and env-var credentials.
+5. Add `boto3` to the harness package dependencies and update `backend/uv.lock`.
+6. Run focused tests, ruff, and whitespace checks.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/artifacts/__init__.py`
+- `backend/packages/harness/deerflow/artifacts/store.py`
+- `backend/packages/harness/pyproject.toml`
+- `backend/uv.lock`
+- `backend/tests/test_runtime_artifact_store.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-s3-artifact-store-review.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_store.py -q
+```
+
+Result:
+
+```text
+ERROR tests/test_runtime_artifact_store.py - ImportError: cannot import name 'S3ArtifactStore'
+Failure confirmed the S3-compatible store and factory did not exist.
+```
+
+Dependency lock:
+
+```bash
+uv --directory backend lock
+```
+
+Result:
+
+```text
+Resolved 222 packages in 32.42s
+Added boto3 v1.43.34
+Added botocore v1.43.34
+Added jmespath v1.1.0
+Added s3transfer v0.19.0
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_storage_config.py tests/test_runtime_artifact_store.py tests/test_reload_boundary.py -q
+uv --directory backend run ruff check packages/harness/deerflow/artifacts packages/harness/deerflow/config/runtime_storage_config.py packages/harness/deerflow/config/app_config.py packages/harness/deerflow/config/reload_boundary.py tests/test_runtime_artifact_store.py tests/test_runtime_storage_config.py
+git diff --check
+```
+
+Result:
+
+```text
+24 passed, 1 warning in 0.23s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Wire object-backed uploads, artifact preview/download, present-file, and view-image flows into the new store.
+- Add sandbox materialize/flush orchestration for `/mnt/user-data` and `/mnt/acp-workspace`.
+- Add provisioner strict object mode that removes runtime PVC mounts and blocks `USERDATA_PVC_NAME`.
+- Add migration tooling and live evidence for object-backed runtime files.
+
+---
+
+## Batch 117: Provisioner Object Runtime PVC Gate
+
+Date: 2026-06-21
+
+### Goal
+
+Ensure the Kubernetes provisioner can run sandbox Pods without the runtime PVC/hostPath user-data mount when object storage is enabled. Object mode must fail closed if runtime PVC configuration is still present.
+
+### Steps
+
+1. Add failing tests for object mode omitting the `user-data` volume, mount, and Pod wiring.
+2. Add failing tests for object mode rejecting `USERDATA_PVC_NAME`.
+3. Add failing tests for object mode rejecting request-scoped extra mounts under `/mnt/user-data`.
+4. Add `RUNTIME_STORAGE_BACKEND=filesystem|object` to the provisioner.
+5. Implement strict validation and remove default `user-data` volume/mount in object mode.
+6. Include `runtime_storage_backend` in the mount contract hash so existing filesystem Pods are not silently reused under object mode.
+
+### Files Changed
+
+- `docker/provisioner/app.py`
+- `backend/tests/test_provisioner_pvc_volumes.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-provisioner-object-runtime-gate-review.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_provisioner_pvc_volumes.py::TestBuildVolumes::test_object_runtime_omits_userdata_volume tests/test_provisioner_pvc_volumes.py::TestBuildVolumes::test_object_runtime_rejects_userdata_pvc tests/test_provisioner_pvc_volumes.py::TestBuildVolumes::test_object_runtime_rejects_extra_userdata_mount tests/test_provisioner_pvc_volumes.py::TestBuildVolumeMounts::test_object_runtime_omits_userdata_mount tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_object_runtime_pod_has_no_userdata_volume_or_mount -q
+```
+
+Result:
+
+```text
+5 failed, 1 warning in 0.58s
+Failures confirmed provisioner still created user-data volume/mount and did not reject USERDATA_PVC_NAME or extra /mnt/user-data mounts.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_provisioner_pvc_volumes.py -q
+uv --directory backend run ruff check ../docker/provisioner/app.py tests/test_provisioner_pvc_volumes.py
+git diff --check
+```
+
+Result:
+
+```text
+31 passed, 1 warning in 0.43s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Wire `RUNTIME_STORAGE_BACKEND=object` into docker-compose/operator docs.
+- Replace object-mode file locks with DB advisory locks so sandbox creation no longer creates thread directories for lock files.
+- Update tool/middleware local-file readers for object mode.
+- Add migration tooling and live evidence for object-backed runtime files.
+
+---
+
+## Batch 119: Object Runtime Sandbox Advisory Lock
+
+Date: 2026-06-21
+
+### Goal
+
+Remove the last object-mode sandbox creation dependency on the runtime PVC path. Before this batch, object mode removed the sandbox mounts but sandbox creation still entered the legacy lock-file path, which called `ensure_thread_dirs()` and created local `.deer-flow` thread directories. Object mode now uses a PostgreSQL advisory lock instead.
+
+### Steps
+
+1. Add a failing provider test proving object-mode sandbox creation must not call `ensure_thread_dirs()`.
+2. Add a failing advisory-lock test for stable lock-key generation and PostgreSQL-only factory behavior.
+3. Add `sandbox_lock.py` with deterministic 63-bit advisory lock keys and a synchronous PostgreSQL advisory lock context manager.
+4. Route object-mode `_discover_or_create_with_lock()` through the advisory lock and keep filesystem mode on the legacy file lock.
+5. Route async object-mode creation through the same sync path in a worker thread so the lock behavior is identical.
+6. Run focused sandbox/object-runtime tests, ruff, and whitespace checks.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/artifacts/sandbox_lock.py`
+- `backend/packages/harness/deerflow/artifacts/__init__.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py`
+- `backend/tests/test_sandbox_advisory_lock.py`
+- `backend/tests/test_aio_sandbox_provider.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-sandbox-advisory-lock-review.md`
+
+### Verification
+
+Red checks:
+
+```bash
+uv --directory backend run pytest tests/test_aio_sandbox_provider.py::test_discover_or_create_object_runtime_uses_advisory_lock_without_thread_dirs -q
+uv --directory backend run pytest tests/test_sandbox_advisory_lock.py -q
+```
+
+Result:
+
+```text
+FAILED tests/test_aio_sandbox_provider.py::test_discover_or_create_object_runtime_uses_advisory_lock_without_thread_dirs - AttributeError: 'AioSandboxProvider' object has no attribute '_sandbox_creation_lock'
+ERROR tests/test_sandbox_advisory_lock.py - ModuleNotFoundError: No module named 'deerflow.artifacts.sandbox_lock'
+Failures confirmed object-mode sandbox creation still used the legacy file-lock path and no DB advisory lock helper existed.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_sandbox_advisory_lock.py tests/test_aio_sandbox_provider.py::test_discover_or_create_object_runtime_uses_advisory_lock_without_thread_dirs tests/test_aio_sandbox.py::TestDownloadFile tests/test_runtime_artifact_materializer.py tests/test_provisioner_pvc_volumes.py tests/test_uploads_router.py tests/test_artifacts_router.py tests/test_runtime_artifact_store.py tests/test_runtime_storage_config.py -q
+uv --directory backend run ruff check packages/harness/deerflow/artifacts packages/harness/deerflow/community/aio_sandbox/aio_sandbox.py packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py app/gateway/routers/uploads.py app/gateway/routers/artifacts.py ../docker/provisioner/app.py tests/test_sandbox_advisory_lock.py tests/test_aio_sandbox_provider.py tests/test_aio_sandbox.py tests/test_runtime_artifact_materializer.py tests/test_provisioner_pvc_volumes.py tests/test_uploads_router.py tests/test_artifacts_router.py tests/test_runtime_artifact_store.py tests/test_runtime_storage_config.py
+git diff --check
+```
+
+Result:
+
+```text
+111 passed, 2 warnings in 0.98s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Wire `RUNTIME_STORAGE_BACKEND=object` and S3-compatible object-store settings into compose/operator documentation.
+- Update tool/middleware local-file readers for object mode.
+- Add migration tooling from `.deer-flow`/runtime PVC files to object storage.
+- Add target-environment live evidence for runtime PVC removal.
+
+---
+
+## Batch 120: Object Runtime Entry Points
+
+Date: 2026-06-21
+
+### Goal
+
+Remove object-mode runtime PVC assumptions from middleware, tools, channels, Feishu downloads, and the embedded client. These paths previously read or wrote `.deer-flow` thread directories even after sandbox mounts were removed.
+
+### Steps
+
+1. Add failing tests for object-mode `ThreadDataMiddleware`, `UploadsMiddleware`, and `present_files`.
+2. Add failing tests for object-mode IM inbound file ingestion and outbound artifact attachment resolution.
+3. Add a failing Feishu resource-download test requiring object storage writes without local upload directories or sandbox sync.
+4. Add a failing `view_image` test requiring image bytes to come from `ArtifactStore`.
+5. Add embedded client object-mode upload/list/delete/get_artifact tests.
+6. Implement object-mode branches while preserving filesystem mode behavior.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/agents/middlewares/thread_data_middleware.py`
+- `backend/packages/harness/deerflow/agents/middlewares/uploads_middleware.py`
+- `backend/packages/harness/deerflow/tools/builtins/present_file_tool.py`
+- `backend/packages/harness/deerflow/tools/builtins/view_image_tool.py`
+- `backend/app/channels/manager.py`
+- `backend/app/channels/feishu.py`
+- `backend/packages/harness/deerflow/client.py`
+- `backend/tests/test_thread_data_middleware.py`
+- `backend/tests/test_uploads_middleware_core_logic.py`
+- `backend/tests/test_present_file_tool_core_logic.py`
+- `backend/tests/test_view_image_tool.py`
+- `backend/tests/test_channels.py`
+- `backend/tests/test_feishu_parser.py`
+- `backend/tests/test_client.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-runtime-entry-points-review.md`
+
+### Verification
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_thread_data_middleware.py tests/test_uploads_middleware_core_logic.py tests/test_present_file_tool_core_logic.py -q
+uv --directory backend run pytest tests/test_channels.py::TestChannelManager::test_ingest_inbound_files_object_runtime_writes_artifact_store tests/test_channels.py::TestExtractArtifacts::test_resolve_attachments_object_runtime_reads_artifact_store -q
+uv --directory backend run pytest tests/test_feishu_parser.py::test_feishu_receive_single_file_object_runtime_writes_artifact_store tests/test_feishu_parser.py::test_feishu_receive_file_replaces_placeholders_in_order -q
+uv --directory backend run pytest tests/test_view_image_tool.py::test_view_image_object_runtime_reads_from_artifact_store tests/test_view_image_tool.py::test_view_image_reads_virtual_uploads_path -q
+uv --directory backend run pytest tests/test_client.py::TestUploads::test_upload_files tests/test_client.py::TestUploads::test_list_uploads tests/test_client.py::TestUploads::test_delete_upload tests/test_client.py::TestUploads::test_object_runtime_upload_list_delete_use_artifact_store tests/test_client.py::TestArtifacts::test_get_artifact tests/test_client.py::TestArtifacts::test_object_runtime_get_artifact_reads_artifact_store -q
+uv --directory backend run ruff check packages/harness/deerflow/agents/middlewares/thread_data_middleware.py packages/harness/deerflow/agents/middlewares/uploads_middleware.py packages/harness/deerflow/tools/builtins/present_file_tool.py packages/harness/deerflow/tools/builtins/view_image_tool.py app/channels/manager.py app/channels/feishu.py packages/harness/deerflow/client.py tests/test_thread_data_middleware.py tests/test_uploads_middleware_core_logic.py tests/test_present_file_tool_core_logic.py tests/test_view_image_tool.py tests/test_channels.py tests/test_feishu_parser.py tests/test_client.py
+```
+
+Result:
+
+```text
+52 passed, 1 warning in 0.38s
+2 passed, 2 warnings across channel object-mode focused tests
+2 passed, 1 warning in 0.23s
+2 passed, 1 warning in 0.51s
+6 passed, 1 warning in 0.66s
+All checks passed!
+```
+
+### Remaining Work
+
+- Add runtime artifact migration tooling.
+- Add static object-storage live-gate preflight.
+- Run target-environment live evidence.
+
+---
+
+## Batch 121: Runtime Artifact Migration and Object Storage Gate
+
+Date: 2026-06-21
+
+### Goal
+
+Make object runtime storage operable for rollout by adding a migration command for existing `.deer-flow`/PVC runtime files, adding a static object-storage gate, and documenting the deployment procedure.
+
+### Steps
+
+1. Add failing tests for importing user-isolated and legacy runtime artifact layouts into `ArtifactStore`.
+2. Add `scripts/import_runtime_artifacts_to_object_store.py` with dry-run and apply support.
+3. Add failing live-gate tests for `runtime_object_storage`.
+4. Implement `runtime_object_storage` preflight over file/DB app config and provisioner env.
+5. Update technical design, operator runbook, and requirement audit.
+
+### Files Changed
+
+- `backend/scripts/import_runtime_artifacts_to_object_store.py`
+- `backend/scripts/check_stateless_live_gates.py`
+- `backend/tests/test_import_runtime_artifacts_to_object_store.py`
+- `backend/tests/test_stateless_live_gate_check.py`
+- `docs/harness-stateless-db-mode-technical-design.md`
+- `docs/harness-stateless-db-mode-operator-runbook.md`
+- `docs/harness-stateless-db-mode-requirement-audit.md`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-runtime-migration-gate-review.md`
+
+### Verification
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_import_runtime_artifacts_to_object_store.py -q
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_runtime_object_storage_gate_rejects_filesystem_runtime tests/test_stateless_live_gate_check.py::test_runtime_object_storage_gate_accepts_object_runtime -q
+uv --directory backend run ruff check scripts/import_runtime_artifacts_to_object_store.py tests/test_import_runtime_artifacts_to_object_store.py scripts/check_stateless_live_gates.py tests/test_stateless_live_gate_check.py
+```
+
+Result:
+
+```text
+3 passed, 1 warning in 0.25s
+2 passed, 1 warning in 0.26s
+All checks passed!
+```
+
+### Remaining Work
+
+- Execute `runtime_object_storage`, `remote_live`, and `requires_llm` gates in the target environment and archive evidence.
+
+---
+
+## Batch 116: Sandbox Object Materialize and Flush
+
+Date: 2026-06-21
+
+### Goal
+
+Remove the sandbox runtime dependency on host/PVC mounts in object mode by materializing object-store files into the sandbox filesystem after sandbox creation/reclaim/discovery and flushing sandbox changes back to object storage before release.
+
+### Steps
+
+1. Add failing tests for `SandboxArtifactMaterializer` materialize and flush behavior.
+2. Add a failing provider test proving object mode must not create `/mnt/user-data` or `/mnt/acp-workspace` host mounts.
+3. Add failing lifecycle tests requiring sandbox creation to call materialize and release to call flush before closing the sandbox client.
+4. Add a failing AIO sandbox download test for `/mnt/acp-workspace` so ACP flush is not silently skipped.
+5. Implement `SandboxArtifactMaterializer`, object-mode mount suppression, provider lifecycle hooks, and ACP download permission.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/artifacts/sandbox_materializer.py`
+- `backend/packages/harness/deerflow/artifacts/__init__.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox.py`
+- `backend/tests/test_runtime_artifact_materializer.py`
+- `backend/tests/test_aio_sandbox_provider.py`
+- `backend/tests/test_aio_sandbox.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-sandbox-materialize-flush-review.md`
+
+### Verification
+
+Red checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py tests/test_aio_sandbox_provider.py::test_get_thread_mounts_object_runtime_skips_user_data_and_acp_mounts -q
+uv --directory backend run pytest tests/test_aio_sandbox_provider.py::test_create_sandbox_materializes_object_runtime_after_ready tests/test_aio_sandbox_provider.py::test_release_flushes_object_runtime_before_closing_sandbox -q
+uv --directory backend run pytest tests/test_aio_sandbox.py::TestDownloadFile::test_allows_acp_workspace_downloads_for_runtime_flush -q
+```
+
+Result:
+
+```text
+ERROR tests/test_runtime_artifact_materializer.py - ModuleNotFoundError: No module named 'deerflow.artifacts.sandbox_materializer'
+1 failed, 1 warning in 0.23s
+2 failed, 1 warning in 0.23s
+1 failed, 1 warning in 0.22s
+Failures confirmed the materializer module, provider lifecycle hooks, and ACP download permission were missing.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_aio_sandbox.py::TestDownloadFile tests/test_runtime_artifact_materializer.py tests/test_aio_sandbox_provider.py::test_get_thread_mounts_object_runtime_skips_user_data_and_acp_mounts tests/test_aio_sandbox_provider.py::test_create_sandbox_materializes_object_runtime_after_ready tests/test_aio_sandbox_provider.py::test_release_flushes_object_runtime_before_closing_sandbox -q
+uv --directory backend run ruff check packages/harness/deerflow/artifacts packages/harness/deerflow/community/aio_sandbox/aio_sandbox.py packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py tests/test_runtime_artifact_materializer.py tests/test_aio_sandbox.py tests/test_aio_sandbox_provider.py
+git diff --check
+```
+
+Result:
+
+```text
+16 passed, 1 warning in 0.27s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Add provisioner strict object mode that removes runtime PVC mounts and fails closed if `USERDATA_PVC_NAME` is set.
+- Replace object-mode file locks with DB advisory locks so sandbox creation no longer requires thread directories.
+- Update tool/middleware local-file readers for object mode.
+- Add migration tooling and live evidence for object-backed runtime files.
+
+---
+
+## Batch 115: Gateway Upload and Artifact Object Mode
+
+Date: 2026-06-21
+
+### Goal
+
+Route the gateway's user-facing runtime file entry/exit points through `ArtifactStore` when `runtime_storage.backend=object`. This starts removing the runtime PVC dependency from uploads and artifact preview/download while leaving filesystem mode unchanged.
+
+### Steps
+
+1. Add failing router tests for object-mode upload, upload listing, upload deletion, artifact text read, and missing artifact 404 behavior.
+2. Add an object-mode upload branch that writes upload bytes directly to `ArtifactStore` without creating thread upload directories or acquiring a sandbox.
+3. Add object-mode upload list/delete branches backed by `ArtifactStore`.
+4. Add an object-mode artifact branch backed by `ArtifactStore`, including `.skill` archive byte extraction support.
+5. Keep file mode as the default path and verify existing upload/artifact router tests.
+
+### Files Changed
+
+- `backend/app/gateway/routers/uploads.py`
+- `backend/app/gateway/routers/artifacts.py`
+- `backend/tests/test_uploads_router.py`
+- `backend/tests/test_artifacts_router.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-gateway-object-mode-review.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_uploads_router.py::test_upload_files_object_mode_writes_uploads_to_artifact_store tests/test_uploads_router.py::test_list_uploaded_files_object_mode_reads_from_artifact_store tests/test_uploads_router.py::test_delete_uploaded_file_object_mode_deletes_from_artifact_store tests/test_artifacts_router.py::test_get_artifact_object_mode_reads_text_from_artifact_store tests/test_artifacts_router.py::test_get_artifact_object_mode_returns_404_for_missing_object -q
+```
+
+Result:
+
+```text
+5 failed, 2 warnings in 0.92s
+Failures confirmed the uploads/artifacts routers had no make_artifact_store object-mode integration.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_uploads_router.py tests/test_artifacts_router.py tests/test_runtime_artifact_store.py tests/test_runtime_storage_config.py -q
+uv --directory backend run ruff check app/gateway/routers/uploads.py app/gateway/routers/artifacts.py packages/harness/deerflow/artifacts tests/test_uploads_router.py tests/test_artifacts_router.py tests/test_runtime_artifact_store.py tests/test_runtime_storage_config.py
+git diff --check
+```
+
+Result:
+
+```text
+63 passed, 2 warnings in 0.73s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Add sandbox materialize/flush orchestration so object-backed files are copied into `/mnt/user-data` and `/mnt/acp-workspace` before/after sandbox execution.
+- Update tools that read local output paths (`present_file`, `view_image`, upload prompt middleware) to use object mode where applicable.
+- Add provisioner strict object mode that removes runtime PVC mounts and blocks `USERDATA_PVC_NAME`.
+- Add migration tooling and live evidence for object-backed runtime files.
+
+---
+
 ## Batch 133: Postgres Stateless Schema SQL Migration
 
 Date: 2026-06-21

@@ -36,6 +36,7 @@ from langchain_core.runnables import RunnableConfig
 from deerflow.agents.lead_agent.agent import build_middlewares
 from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.thread_state import ThreadState
+from deerflow.artifacts.store import ArtifactPathError, ArtifactStore, make_artifact_store, parse_artifact_virtual_path
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, reload_app_config
 from deerflow.config.bootstrap import is_db_config_enabled
@@ -47,17 +48,26 @@ from deerflow.skills.storage import get_or_new_skill_storage
 from deerflow.tools.builtins.tool_search import assemble_deferred_tools
 from deerflow.tracing import build_tracing_callbacks, inject_langfuse_metadata
 from deerflow.uploads.manager import (
+    PathTraversalError,
     claim_unique_filename,
     delete_file_safe,
     enrich_file_listing,
     ensure_uploads_dir,
     get_uploads_dir,
     list_files_in_dir,
+    normalize_filename,
     upload_artifact_url,
     upload_virtual_path,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_runtime_artifact_store() -> ArtifactStore | None:
+    runtime_storage = getattr(get_app_config(), "runtime_storage", None)
+    if getattr(runtime_storage, "backend", None) != "object":
+        return None
+    return make_artifact_store(runtime_storage)
 
 
 StreamEventType = Literal["values", "messages-tuple", "custom", "end"]
@@ -1257,6 +1267,32 @@ class DeerFlowClient:
             if not has_convertible_file and p.suffix.lower() in CONVERTIBLE_EXTENSIONS:
                 has_convertible_file = True
 
+        artifact_store = _get_runtime_artifact_store()
+        if artifact_store is not None:
+            user_id = get_effective_user_id()
+            uploaded_files: list[dict] = []
+            for src_path, dest_name in resolved_files:
+                virtual_path = upload_virtual_path(dest_name)
+                data = src_path.read_bytes()
+                content_type, _ = mimetypes.guess_type(dest_name)
+                artifact_store.put_bytes(user_id, thread_id, virtual_path, data, content_type=content_type)
+                info: dict[str, Any] = {
+                    "filename": dest_name,
+                    "size": len(data),
+                    "path": virtual_path,
+                    "virtual_path": virtual_path,
+                    "artifact_url": upload_artifact_url(thread_id, dest_name),
+                }
+                if dest_name != src_path.name:
+                    info["original_filename"] = src_path.name
+                uploaded_files.append(info)
+
+            return {
+                "success": True,
+                "files": uploaded_files,
+                "message": f"Successfully uploaded {len(uploaded_files)} file(s)",
+            }
+
         uploads_dir = ensure_uploads_dir(thread_id)
         uploaded_files: list[dict] = []
 
@@ -1332,6 +1368,22 @@ class DeerFlowClient:
             Dict with "files" and "count" keys, matching the Gateway API
             ``list_uploaded_files`` response.
         """
+        artifact_store = _get_runtime_artifact_store()
+        if artifact_store is not None:
+            files = []
+            for item in artifact_store.list_files(get_effective_user_id(), thread_id, "/mnt/user-data/uploads"):
+                filename = Path(item.virtual_path).name
+                files.append(
+                    {
+                        "filename": filename,
+                        "size": item.size,
+                        "path": item.virtual_path,
+                        "virtual_path": item.virtual_path,
+                        "artifact_url": upload_artifact_url(thread_id, filename),
+                    }
+                )
+            return {"files": files, "count": len(files)}
+
         uploads_dir = get_uploads_dir(thread_id)
         result = list_files_in_dir(uploads_dir)
         return enrich_file_listing(result, thread_id)
@@ -1352,6 +1404,24 @@ class DeerFlowClient:
             PermissionError: If path traversal is detected.
         """
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS
+
+        artifact_store = _get_runtime_artifact_store()
+        if artifact_store is not None:
+            try:
+                safe_filename = normalize_filename(filename)
+            except ValueError as exc:
+                raise PathTraversalError("Path traversal detected") from exc
+            if safe_filename != filename:
+                raise PathTraversalError("Path traversal detected")
+            virtual_path = upload_virtual_path(safe_filename)
+            try:
+                artifact_store.get_bytes(get_effective_user_id(), thread_id, virtual_path)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"File not found: {filename}") from None
+            artifact_store.delete(get_effective_user_id(), thread_id, virtual_path)
+            if Path(safe_filename).suffix.lower() in CONVERTIBLE_EXTENSIONS:
+                artifact_store.delete(get_effective_user_id(), thread_id, upload_virtual_path(f"{Path(safe_filename).stem}.md"))
+            return {"success": True, "message": f"Deleted {safe_filename}"}
 
         uploads_dir = get_uploads_dir(thread_id)
         return delete_file_safe(uploads_dir, filename, convertible_extensions=CONVERTIBLE_EXTENSIONS)
@@ -1374,12 +1444,23 @@ class DeerFlowClient:
             FileNotFoundError: If the artifact does not exist.
             ValueError: If the path is invalid.
         """
+        artifact_store = _get_runtime_artifact_store()
+        if artifact_store is not None:
+            virtual_path = f"/{path.lstrip('/')}"
+            try:
+                parsed = parse_artifact_virtual_path(virtual_path)
+            except ArtifactPathError as exc:
+                if ".." in path.replace("\\", "/").split("/"):
+                    raise PathTraversalError("Path traversal detected") from exc
+                raise ValueError(str(exc)) from exc
+            data = artifact_store.get_bytes(get_effective_user_id(), thread_id, parsed.virtual_path)
+            mime_type, _ = mimetypes.guess_type(parsed.virtual_path)
+            return data, mime_type or "application/octet-stream"
+
         try:
             actual = get_paths().resolve_virtual_path(thread_id, path, user_id=get_effective_user_id())
         except ValueError as exc:
             if "traversal" in str(exc):
-                from deerflow.uploads.manager import PathTraversalError
-
                 raise PathTraversalError("Path traversal detected") from exc
             raise
         if not actual.exists():

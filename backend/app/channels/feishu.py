@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import re
 import threading
 import time
@@ -22,6 +23,8 @@ from app.channels.message_bus import (
     OutboundMessage,
     ResolvedAttachment,
 )
+from deerflow.artifacts.store import ArtifactStore, make_artifact_store
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
@@ -32,6 +35,13 @@ PENDING_CLARIFICATION_TTL_SECONDS = 30 * 60
 
 def _is_feishu_command(text: str) -> bool:
     return is_known_channel_command(text)
+
+
+def _get_runtime_artifact_store() -> ArtifactStore | None:
+    config = get_app_config()
+    if config.runtime_storage.backend != "object":
+        return None
+    return make_artifact_store(config.runtime_storage)
 
 
 class FeishuChannel(Channel):
@@ -380,10 +390,7 @@ class FeishuChannel(Channel):
             logger.warning("[Feishu] empty resource content: resource_key=%s, type=%s", file_key, type)
             return f"Failed to obtain the [{type}]"
 
-        paths = get_paths()
         effective_user_id = user_id or get_effective_user_id()
-        paths.ensure_thread_dirs(thread_id, user_id=effective_user_id)
-        uploads_dir = paths.sandbox_uploads_dir(thread_id, user_id=effective_user_id).resolve()
 
         ext = "png" if type == "image" else "bin"
         raw_filename = getattr(response, "file_name", "") or f"feishu_{file_key[-12:]}.{ext}"
@@ -395,6 +402,29 @@ class FeishuChannel(Channel):
             filename = f"{name_part}.{ext}"
         else:
             filename = re.sub(r"[./\\]", "_", raw_filename)
+
+        virtual_path = f"{VIRTUAL_PATH_PREFIX}/uploads/{filename}"
+        artifact_store = _get_runtime_artifact_store()
+        if artifact_store is not None:
+            content_type, _ = mimetypes.guess_type(filename)
+            try:
+                await asyncio.to_thread(
+                    artifact_store.put_bytes,
+                    effective_user_id,
+                    thread_id,
+                    virtual_path,
+                    content,
+                    content_type=content_type,
+                )
+            except Exception:
+                logger.exception("[Feishu] failed to persist downloaded resource to object storage: %s, type=%s", virtual_path, type)
+                return f"Failed to obtain the [{type}]"
+            logger.info("[Feishu] downloaded resource mapped: file_key=%s -> %s", file_key, virtual_path)
+            return virtual_path
+
+        paths = get_paths()
+        paths.ensure_thread_dirs(thread_id, user_id=effective_user_id)
+        uploads_dir = paths.sandbox_uploads_dir(thread_id, user_id=effective_user_id).resolve()
         resolved_target = uploads_dir / filename
 
         def down_load():

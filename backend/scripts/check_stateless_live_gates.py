@@ -40,6 +40,7 @@ class GateSpec:
     manual_prerequisites: tuple[str, ...] = ()
     requires_model_config: bool = False
     requires_mcp_stateless_config: bool = False
+    requires_runtime_object_storage: bool = False
 
 
 GATE_SPECS: dict[str, GateSpec] = {
@@ -90,6 +91,27 @@ GATE_SPECS: dict[str, GateSpec] = {
             "HTTP/SSE MCP servers are remote services or enabled stdio MCP servers are explicitly deployed as sticky, sidecar, or single-node compatible",
         ),
     ),
+    "runtime_object_storage": GateSpec(
+        name="runtime_object_storage",
+        description="Runtime PVC removal static gate for object-backed workspace/uploads/outputs/ACP files",
+        command=[
+            "uv",
+            "--directory",
+            "backend",
+            "run",
+            "python",
+            "scripts/check_stateless_live_gates.py",
+            "--gate",
+            "runtime_object_storage",
+            "--json",
+        ],
+        requires_runtime_object_storage=True,
+        manual_prerequisites=(
+            "Gateway/runtime config sets runtime_storage.backend=object with a configured object_store",
+            "Sandbox provisioner is deployed with RUNTIME_STORAGE_BACKEND=object and without USERDATA_PVC_NAME",
+            "Existing runtime PVC/.deer-flow files have been imported with scripts/import_runtime_artifacts_to_object_store.py",
+        ),
+    ),
 }
 
 
@@ -128,6 +150,8 @@ def _gate_report(spec: GateSpec, env: Mapping[str, str], project_root: Path) -> 
         readiness_reports.append(_llm_config_readiness(project_root, env))
     if spec.requires_mcp_stateless_config:
         readiness_reports.append(_mcp_stateless_readiness(project_root, env))
+    if spec.requires_runtime_object_storage:
+        readiness_reports.append(_runtime_object_storage_readiness(project_root, env))
 
     config_issues: list[str] = []
     mcp_compatibility: list[dict[str, object]] = []
@@ -244,6 +268,15 @@ def _mcp_stateless_readiness(project_root: Path, env: Mapping[str, str]) -> Conf
     return _file_mcp_stateless_readiness(project_root, env)
 
 
+def _runtime_object_storage_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
+    source_mode = env.get("DEER_FLOW_CONFIG_SOURCE", "file").strip().lower() or "file"
+    if source_mode == "db":
+        return _db_runtime_object_storage_readiness(env)
+    if source_mode != "file":
+        return ConfigReadiness(config_issues=[f"DEER_FLOW_CONFIG_SOURCE must be 'file' or 'db', got {source_mode!r}"])
+    return _file_runtime_object_storage_readiness(project_root, env)
+
+
 def _file_llm_config_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
     explicit_config_path = _env_value(env, "DEER_FLOW_CONFIG_PATH")
     config_path = Path(explicit_config_path) if explicit_config_path else _project_config_path(project_root, env)
@@ -288,6 +321,25 @@ def _file_mcp_stateless_readiness(project_root: Path, env: Mapping[str, str]) ->
     except json.JSONDecodeError as exc:
         return ConfigReadiness(config_issues=[f"{config_path} is invalid JSON: {exc}"], checked_env=checked_env)
     return _mcp_payload_readiness(payload, source_label=str(config_path), checked_env=checked_env)
+
+
+def _file_runtime_object_storage_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
+    explicit_config_path = _env_value(env, "DEER_FLOW_CONFIG_PATH")
+    config_path = Path(explicit_config_path) if explicit_config_path else _project_config_path(project_root, env)
+    if isinstance(config_path, ConfigReadiness):
+        return config_path
+    if not config_path.is_file():
+        if explicit_config_path:
+            return ConfigReadiness(config_issues=[f"DEER_FLOW_CONFIG_PATH file not found: {config_path}"])
+        if _env_value(env, "DEER_FLOW_PROJECT_ROOT"):
+            return ConfigReadiness(config_issues=[f"DEER_FLOW_PROJECT_ROOT config.yaml not found: {config_path}"])
+        return ConfigReadiness(config_issues=["config.yaml not found"])
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        return ConfigReadiness(config_issues=[f"{config_path} is invalid YAML: {exc}"])
+    source_label = _file_config_source_label(config_path, env, explicit_config_path=explicit_config_path)
+    return _runtime_object_payload_readiness(payload, source_label=source_label, env=env)
 
 
 def _project_config_path(project_root: Path, env: Mapping[str, str]) -> Path | ConfigReadiness:
@@ -396,6 +448,40 @@ def _db_mcp_stateless_readiness(env: Mapping[str, str]) -> ConfigReadiness:
     return readiness
 
 
+def _db_runtime_object_storage_readiness(env: Mapping[str, str]) -> ConfigReadiness:
+    database_url = env.get("DEER_FLOW_DATABASE_URL", "").strip()
+    checked_env = ["DEER_FLOW_DATABASE_URL", "RUNTIME_STORAGE_BACKEND", "USERDATA_PVC_NAME"]
+    if not database_url:
+        return ConfigReadiness(
+            config_issues=["DEER_FLOW_DATABASE_URL is required when DEER_FLOW_CONFIG_SOURCE=db"],
+            checked_env=checked_env,
+        )
+    try:
+        engine = create_engine(_sync_sqlalchemy_url(database_url))
+        try:
+            with Session(engine) as session:
+                row = session.get(RuntimeConfigRow, "app")
+                if row is None:
+                    return ConfigReadiness(
+                        config_issues=["DB runtime config key 'app' not found"],
+                        checked_env=checked_env,
+                    )
+                payload = row.payload_json
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        return ConfigReadiness(
+            config_issues=[f"DB runtime config could not be loaded: {exc}"],
+            checked_env=checked_env,
+        )
+    readiness = _runtime_object_payload_readiness(payload, source_label="DB runtime config key 'app'", env=env)
+    return ConfigReadiness(
+        config_issues=readiness.config_issues,
+        missing_env=readiness.missing_env,
+        checked_env=sorted({"DEER_FLOW_DATABASE_URL", *readiness.checked_env}),
+    )
+
+
 def _sync_sqlalchemy_url(url: str) -> str:
     from deerflow.config.bootstrap import database_config_from_url
 
@@ -434,6 +520,34 @@ def _model_payload_readiness(payload: object, *, source_label: str, env: Mapping
         missing_env=sorted(name for name in env_refs if not env.get(name)),
         checked_env=sorted(env_refs),
     )
+
+
+def _runtime_object_payload_readiness(payload: object, *, source_label: str, env: Mapping[str, str]) -> ConfigReadiness:
+    checked_env = ["RUNTIME_STORAGE_BACKEND", "USERDATA_PVC_NAME"]
+    config_issues: list[str] = []
+
+    if not isinstance(payload, dict):
+        config_issues.append(f"{source_label} top-level value is not an object")
+    runtime_storage = payload.get("runtime_storage") if isinstance(payload, dict) else None
+    if not isinstance(runtime_storage, dict):
+        runtime_storage = {}
+    backend = str(runtime_storage.get("backend") or "filesystem").strip().lower()
+    if backend != "object":
+        config_issues.append(f"{source_label} runtime_storage.backend must be 'object' for runtime PVC removal")
+
+    object_store = runtime_storage.get("object_store")
+    if not isinstance(object_store, dict):
+        config_issues.append(f"{source_label} runtime_storage.object_store is required when backend is object")
+    elif not str(object_store.get("bucket") or "").strip():
+        config_issues.append(f"{source_label} runtime_storage.object_store.bucket is required")
+
+    provisioner_backend = _env_value(env, "RUNTIME_STORAGE_BACKEND")
+    if provisioner_backend != "object":
+        config_issues.append("provisioner RUNTIME_STORAGE_BACKEND must be 'object' for runtime PVC removal")
+    if _env_value(env, "USERDATA_PVC_NAME"):
+        config_issues.append("provisioner USERDATA_PVC_NAME must be unset when runtime storage is object")
+
+    return ConfigReadiness(config_issues=config_issues, checked_env=checked_env)
 
 
 _STATELESS_MCP_STDIO_RUNTIME_MODES = {"sticky", "sidecar", "single-node"}

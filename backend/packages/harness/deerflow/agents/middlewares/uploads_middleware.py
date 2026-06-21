@@ -10,6 +10,8 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import run_in_executor
 from langgraph.runtime import Runtime
 
+from deerflow.artifacts.store import ArtifactStore, make_artifact_store
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import Paths, get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.utils.file_conversion import extract_outline
@@ -57,6 +59,23 @@ def _extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     except Exception:
         logger.debug("Failed to read preview lines from %s", md_path, exc_info=True)
     return [], preview
+
+
+def _runtime_artifact_store() -> ArtifactStore | None:
+    config = get_app_config()
+    if config.runtime_storage.backend != "object":
+        return None
+    return make_artifact_store(config.runtime_storage)
+
+
+def _filename_from_upload_virtual_path(virtual_path: str) -> str | None:
+    prefix = "/mnt/user-data/uploads/"
+    if not virtual_path.startswith(prefix):
+        return None
+    filename = virtual_path.removeprefix(prefix)
+    if not filename or "/" in filename or "\\" in filename or Path(filename).name != filename:
+        return None
+    return filename
 
 
 class UploadsMiddlewareState(AgentState):
@@ -186,6 +205,64 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
             )
         return files if files else None
 
+    def _files_from_kwargs_metadata(self, message: HumanMessage, uploaded_by_name: dict[str, tuple[int, str | None]]) -> list[dict] | None:
+        kwargs_files = (message.additional_kwargs or {}).get("files")
+        if not isinstance(kwargs_files, list) or not kwargs_files:
+            return None
+
+        files: list[dict] = []
+        for f in kwargs_files:
+            if not isinstance(f, dict):
+                continue
+            filename = f.get("filename") or ""
+            if not filename or Path(filename).name != filename:
+                continue
+            metadata = uploaded_by_name.get(filename)
+            if metadata is None:
+                continue
+            size, _content_type = metadata
+            files.append(
+                {
+                    "filename": filename,
+                    "size": size,
+                    "path": f"/mnt/user-data/uploads/{filename}",
+                    "extension": Path(filename).suffix,
+                }
+            )
+        return files if files else None
+
+    def _files_from_artifact_store(self, *, artifact_store: ArtifactStore, thread_id: str, user_id: str, last_message: HumanMessage) -> tuple[list[dict], list[dict]]:
+        uploaded = artifact_store.list_files(user_id, thread_id, "/mnt/user-data/uploads")
+        uploaded_by_name: dict[str, tuple[int, str | None]] = {}
+        historical_files: list[dict] = []
+        for item in uploaded:
+            filename = _filename_from_upload_virtual_path(item.virtual_path)
+            if filename is None:
+                continue
+            uploaded_by_name[filename] = (item.size, item.content_type)
+
+        new_files = self._files_from_kwargs_metadata(last_message, uploaded_by_name) or []
+        new_filenames = {f["filename"] for f in new_files}
+        for filename, (size, content_type) in sorted(uploaded_by_name.items()):
+            if filename in new_filenames:
+                continue
+            historical_files.append(
+                {
+                    "filename": filename,
+                    "size": size,
+                    "path": f"/mnt/user-data/uploads/{filename}",
+                    "extension": Path(filename).suffix,
+                    "outline": [],
+                    "outline_preview": [],
+                }
+            )
+
+        for file in new_files:
+            file["outline"] = []
+            file["outline_preview"] = []
+
+        return new_files, historical_files
+
     @override
     def before_agent(self, state: UploadsMiddlewareState, runtime: Runtime) -> dict | None:
         """Inject uploaded files information before agent execution.
@@ -224,37 +301,47 @@ class UploadsMiddleware(AgentMiddleware[UploadsMiddlewareState]):
                 thread_id = get_config().get("configurable", {}).get("thread_id")
             except RuntimeError:
                 pass  # get_config() raises outside a runnable context (e.g. unit tests)
-        uploads_dir = self._paths.sandbox_uploads_dir(thread_id, user_id=get_effective_user_id()) if thread_id else None
+        user_id = get_effective_user_id()
+        artifact_store = _runtime_artifact_store() if thread_id else None
+        if artifact_store is not None and thread_id:
+            new_files, historical_files = self._files_from_artifact_store(
+                artifact_store=artifact_store,
+                thread_id=thread_id,
+                user_id=user_id,
+                last_message=last_message,
+            )
+        else:
+            uploads_dir = self._paths.sandbox_uploads_dir(thread_id, user_id=user_id) if thread_id else None
 
-        # Get newly uploaded files from the current message's additional_kwargs.files
-        new_files = self._files_from_kwargs(last_message, uploads_dir) or []
+            # Get newly uploaded files from the current message's additional_kwargs.files
+            new_files = self._files_from_kwargs(last_message, uploads_dir) or []
 
-        # Collect historical files from the uploads directory (all except the new ones)
-        new_filenames = {f["filename"] for f in new_files}
-        historical_files: list[dict] = []
-        if uploads_dir and uploads_dir.exists():
-            for file_path in sorted(uploads_dir.iterdir()):
-                if file_path.is_file() and file_path.name not in new_filenames:
-                    stat = file_path.stat()
-                    outline, preview = _extract_outline_for_file(file_path)
-                    historical_files.append(
-                        {
-                            "filename": file_path.name,
-                            "size": stat.st_size,
-                            "path": f"/mnt/user-data/uploads/{file_path.name}",
-                            "extension": file_path.suffix,
-                            "outline": outline,
-                            "outline_preview": preview,
-                        }
-                    )
+            # Collect historical files from the uploads directory (all except the new ones)
+            new_filenames = {f["filename"] for f in new_files}
+            historical_files: list[dict] = []
+            if uploads_dir and uploads_dir.exists():
+                for file_path in sorted(uploads_dir.iterdir()):
+                    if file_path.is_file() and file_path.name not in new_filenames:
+                        stat = file_path.stat()
+                        outline, preview = _extract_outline_for_file(file_path)
+                        historical_files.append(
+                            {
+                                "filename": file_path.name,
+                                "size": stat.st_size,
+                                "path": f"/mnt/user-data/uploads/{file_path.name}",
+                                "extension": file_path.suffix,
+                                "outline": outline,
+                                "outline_preview": preview,
+                            }
+                        )
 
-        # Attach outlines to new files as well
-        if uploads_dir:
-            for file in new_files:
-                phys_path = uploads_dir / file["filename"]
-                outline, preview = _extract_outline_for_file(phys_path)
-                file["outline"] = outline
-                file["outline_preview"] = preview
+            # Attach outlines to new files as well
+            if uploads_dir:
+                for file in new_files:
+                    phys_path = uploads_dir / file["filename"]
+                    outline, preview = _extract_outline_for_file(phys_path)
+                    file["outline"] = outline
+                    file["outline_preview"] = preview
 
         if not new_files and not historical_files:
             return None

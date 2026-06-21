@@ -878,6 +878,60 @@ Provisioner create payload includes the mount contract:
 
 The bundled provisioner translates `host_path` into a `hostPath` volume with `DirectoryOrCreate`. Other provisioner implementations may translate it into a PVC, emptyDir, or equivalent K8s volume source. The observable requirement is that `container_path` exists and is writable by the AIO shell/file API user before runtime-context materialization runs.
 
+### 10.4 Runtime Object Storage and PVC Removal
+
+DB-backed config/memory/skills removes control-state files, but `/mnt/user-data` and `/mnt/acp-workspace` are runtime artifact paths. Strict stateless mode removes the runtime PVC by storing those files in an S3-compatible object store.
+
+Object key layout:
+
+```text
+{prefix}/users/{user_id}/threads/{thread_id}/user-data/workspace/{path}
+{prefix}/users/{user_id}/threads/{thread_id}/user-data/uploads/{path}
+{prefix}/users/{user_id}/threads/{thread_id}/user-data/outputs/{path}
+{prefix}/users/{user_id}/threads/{thread_id}/acp-workspace/{path}
+```
+
+Runtime config:
+
+```yaml
+runtime_storage:
+  backend: object
+  object_store:
+    provider: s3
+    endpoint_url: http://seaweedfs-s3:8333
+    bucket: deerflow-runtime
+    prefix: deerflow
+    path_style: true
+```
+
+Implemented runtime paths:
+
+- Gateway upload/list/delete routes write and read `ArtifactStore` in object mode.
+- Gateway artifact preview/download reads `ArtifactStore`, including `.skill` archive member extraction.
+- Embedded `DeerFlowClient` upload/list/delete/get_artifact uses `ArtifactStore` in object mode.
+- `ThreadDataMiddleware` returns virtual `/mnt/user-data/...` paths instead of creating local thread directories.
+- `UploadsMiddleware` lists historical uploads from `ArtifactStore`.
+- `present_files` accepts virtual output paths without resolving `.deer-flow`.
+- `view_image` reads image bytes from `ArtifactStore` while keeping MIME/magic/size checks.
+- IM channel inbound files write object uploads; outbound artifacts are materialized to temporary files for existing channel adapters.
+- Feishu resource downloads write object uploads and skip local sandbox sync.
+- AIO sandbox lifecycle materializes object files after create/discover/reclaim and flushes workspace/uploads/outputs/ACP files before release.
+- Object-mode sandbox creation uses PostgreSQL advisory locks instead of local lock files.
+- Bundled provisioner omits `/mnt/user-data`, rejects `USERDATA_PVC_NAME`, rejects extra mounts under `/mnt/user-data` or `/mnt/acp-workspace`, and records `runtime_storage_backend` in the mount-contract hash.
+
+Open-source object storage recommendation:
+
+- SeaweedFS S3 Gateway is the default recommendation for lightweight K8s deployment.
+- MinIO is acceptable when stronger S3 operational tooling is preferred.
+- Ceph RGW is acceptable when Ceph already exists in the platform.
+
+Strict static gate:
+
+```bash
+RUNTIME_STORAGE_BACKEND=object \
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate runtime_object_storage --json
+```
+
 ---
 
 ## 11. Migration Tool
@@ -885,6 +939,7 @@ The bundled provisioner translates `host_path` into a `hostPath` volume with `Di
 Create:
 
 - `backend/scripts/import_runtime_state_to_db.py`
+- `backend/scripts/import_runtime_artifacts_to_object_store.py`
 
 Commands:
 
@@ -892,6 +947,8 @@ Commands:
 uv --directory backend run python scripts/import_runtime_state_to_db.py --dry-run
 uv --directory backend run python scripts/import_runtime_state_to_db.py --apply
 uv --directory backend run python scripts/import_runtime_state_to_db.py --apply --overwrite
+uv --directory backend run python scripts/import_runtime_artifacts_to_object_store.py --state-dir /path/to/.deer-flow --dry-run --json
+uv --directory backend run python scripts/import_runtime_artifacts_to_object_store.py --state-dir /path/to/.deer-flow --json
 ```
 
 Dry-run must report:

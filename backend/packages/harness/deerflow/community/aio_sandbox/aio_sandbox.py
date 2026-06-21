@@ -15,6 +15,7 @@ from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path,
 logger = logging.getLogger(__name__)
 
 _MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+_ACP_WORKSPACE_PREFIX = "/mnt/acp-workspace"
 
 _ERROR_OBSERVATION_SIGNATURE = "'ErrorObservation' object has no attribute 'exit_code'"
 
@@ -189,10 +190,10 @@ class AioSandbox(Sandbox):
                 raise PermissionError(f"Access denied: path traversal detected in '{path}'")
 
         stripped_path = normalised.lstrip("/")
-        allowed_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
-        if stripped_path != allowed_prefix and not stripped_path.startswith(f"{allowed_prefix}/"):
-            logger.error("Refused download outside allowed directory: path=%s, allowed_prefix=%s", path, VIRTUAL_PATH_PREFIX)
-            raise PermissionError(f"Access denied: path must be under '{VIRTUAL_PATH_PREFIX}': '{path}'")
+        allowed_prefixes = (VIRTUAL_PATH_PREFIX.lstrip("/"), _ACP_WORKSPACE_PREFIX.lstrip("/"))
+        if not any(stripped_path == prefix or stripped_path.startswith(f"{prefix}/") for prefix in allowed_prefixes):
+            logger.error("Refused download outside allowed directory set: path=%s, allowed_prefixes=%s", path, allowed_prefixes)
+            raise PermissionError(f"Access denied: path must be under one of {allowed_prefixes}: '{path}'")
 
         with self._lock:
             try:

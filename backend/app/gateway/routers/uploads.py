@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app.gateway.authz import require_permission
 from app.gateway.deps import get_config
+from deerflow.artifacts.store import ArtifactStore, make_artifact_store
 from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import get_paths
 from deerflow.runtime.user_context import get_effective_user_id
@@ -153,6 +154,13 @@ def _get_upload_limits(app_config: AppConfig) -> UploadLimits:
     )
 
 
+def _get_runtime_artifact_store(app_config: AppConfig) -> ArtifactStore | None:
+    runtime_storage = getattr(app_config, "runtime_storage", None)
+    if runtime_storage is None:
+        return None
+    return make_artifact_store(runtime_storage)
+
+
 def _cleanup_uploaded_paths(paths: list[os.PathLike[str] | str]) -> None:
     for path in reversed(paths):
         try:
@@ -195,6 +203,27 @@ async def _write_upload_file_with_limits(
     return file_path, file_size, total_size
 
 
+async def _read_upload_file_with_limits(
+    file: UploadFile,
+    *,
+    display_filename: str,
+    max_single_file_size: int,
+    max_total_size: int,
+    total_size: int,
+) -> tuple[bytes, int, int]:
+    chunks: list[bytes] = []
+    file_size = 0
+    while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+        file_size += len(chunk)
+        total_size += len(chunk)
+        if file_size > max_single_file_size:
+            raise HTTPException(status_code=413, detail=f"File too large: {display_filename}")
+        if total_size > max_total_size:
+            raise HTTPException(status_code=413, detail="Total upload size too large")
+        chunks.append(chunk)
+    return b"".join(chunks), file_size, total_size
+
+
 def _auto_convert_documents_enabled(app_config: AppConfig) -> bool:
     """Return whether automatic host-side document conversion is enabled.
 
@@ -208,6 +237,108 @@ def _auto_convert_documents_enabled(app_config: AppConfig) -> bool:
         return bool(raw)
     except Exception:
         return False
+
+
+async def _upload_files_to_artifact_store(
+    thread_id: str,
+    files: list[UploadFile],
+    *,
+    config: AppConfig,
+    artifact_store: ArtifactStore,
+) -> UploadResponse:
+    limits = _get_upload_limits(config)
+    uploaded_files = []
+    skipped_files = []
+    seen_filenames: set[str] = set()
+    total_size = 0
+    stored_virtual_paths: list[str] = []
+    user_id = get_effective_user_id()
+
+    for file in files:
+        if not file.filename:
+            continue
+        try:
+            original_filename = normalize_filename(file.filename)
+            safe_filename = claim_unique_filename(original_filename, seen_filenames)
+        except ValueError:
+            logger.warning("Skipping file with unsafe filename: %r", file.filename)
+            continue
+
+        try:
+            data, file_size, total_size = await _read_upload_file_with_limits(
+                file,
+                display_filename=safe_filename,
+                max_single_file_size=limits.max_file_size,
+                max_total_size=limits.max_total_size,
+                total_size=total_size,
+            )
+            virtual_path = upload_virtual_path(safe_filename)
+            artifact_store.put_bytes(
+                user_id,
+                thread_id,
+                virtual_path,
+                data,
+                content_type=getattr(file, "content_type", None),
+                metadata={"filename": safe_filename},
+            )
+            stored_virtual_paths.append(virtual_path)
+
+            file_info = {
+                "filename": safe_filename,
+                "size": file_size,
+                "path": virtual_path,
+                "virtual_path": virtual_path,
+                "artifact_url": upload_artifact_url(thread_id, safe_filename),
+                "extension": os.path.splitext(safe_filename)[1],
+            }
+            if safe_filename != original_filename:
+                file_info["original_filename"] = original_filename
+            uploaded_files.append(file_info)
+        except HTTPException:
+            for virtual_path in reversed(stored_virtual_paths):
+                artifact_store.delete(user_id, thread_id, virtual_path)
+            raise
+        except Exception as e:
+            for virtual_path in reversed(stored_virtual_paths):
+                artifact_store.delete(user_id, thread_id, virtual_path)
+            logger.error("Failed to upload %s to object storage: %s", file.filename, e)
+            raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
+
+    message = f"Successfully uploaded {len(uploaded_files)} file(s)"
+    if skipped_files:
+        message += f"; skipped {len(skipped_files)} unsafe file(s)"
+    return UploadResponse(success=not skipped_files, files=uploaded_files, message=message, skipped_files=skipped_files)
+
+
+def _list_uploaded_files_from_artifact_store(thread_id: str, *, artifact_store: ArtifactStore) -> UploadListResponse:
+    user_id = get_effective_user_id()
+    items = artifact_store.list_files(user_id, thread_id, f"{upload_virtual_path('')}".rstrip("/"))
+    files = []
+    for item in items:
+        filename = os.path.basename(item.virtual_path)
+        files.append(
+            {
+                "filename": filename,
+                "size": item.size,
+                "path": item.virtual_path,
+                "virtual_path": item.virtual_path,
+                "artifact_url": upload_artifact_url(thread_id, filename),
+                "extension": os.path.splitext(filename)[1],
+                "modified": item.updated_at.timestamp(),
+            }
+        )
+    return UploadListResponse(files=files, count=len(files))
+
+
+def _delete_uploaded_file_from_artifact_store(thread_id: str, filename: str, *, artifact_store: ArtifactStore) -> dict:
+    safe_filename = normalize_filename(filename)
+    if safe_filename != filename:
+        raise PathTraversalError("Invalid path")
+    user_id = get_effective_user_id()
+    artifact_store.delete(user_id, thread_id, upload_virtual_path(safe_filename))
+    if os.path.splitext(safe_filename)[1].lower() in CONVERTIBLE_EXTENSIONS:
+        artifact_store.delete(user_id, thread_id, upload_virtual_path(f"{os.path.splitext(safe_filename)[0]}.md"))
+    return {"success": True, "message": f"Deleted {safe_filename}"}
 
 
 @router.post("", response_model=UploadResponse)
@@ -225,6 +356,10 @@ async def upload_files(
     limits = _get_upload_limits(config)
     if len(files) > limits.max_files:
         raise HTTPException(status_code=413, detail=f"Too many files: maximum is {limits.max_files}")
+
+    artifact_store = _get_runtime_artifact_store(config)
+    if artifact_store is not None:
+        return await _upload_files_to_artifact_store(thread_id, files, config=config, artifact_store=artifact_store)
 
     try:
         uploads_dir = ensure_uploads_dir(thread_id)
@@ -359,8 +494,12 @@ async def get_upload_limits(
 
 @router.get("/list", response_model=UploadListResponse)
 @require_permission("threads", "read", owner_check=True)
-async def list_uploaded_files(thread_id: str, request: Request) -> UploadListResponse:
+async def list_uploaded_files(thread_id: str, request: Request, config: AppConfig = Depends(get_config)) -> UploadListResponse:
     """List all files in a thread's uploads directory."""
+    artifact_store = _get_runtime_artifact_store(config)
+    if artifact_store is not None:
+        return _list_uploaded_files_from_artifact_store(thread_id, artifact_store=artifact_store)
+
     try:
         uploads_dir = get_uploads_dir(thread_id)
     except ValueError as e:
@@ -378,8 +517,15 @@ async def list_uploaded_files(thread_id: str, request: Request) -> UploadListRes
 
 @router.delete("/{filename}")
 @require_permission("threads", "delete", owner_check=True, require_existing=True)
-async def delete_uploaded_file(thread_id: str, filename: str, request: Request) -> dict:
+async def delete_uploaded_file(thread_id: str, filename: str, request: Request, config: AppConfig = Depends(get_config)) -> dict:
     """Delete a file from a thread's uploads directory."""
+    artifact_store = _get_runtime_artifact_store(config)
+    if artifact_store is not None:
+        try:
+            return _delete_uploaded_file_from_artifact_store(thread_id, filename, artifact_store=artifact_store)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid path")
+
     try:
         uploads_dir = get_uploads_dir(thread_id)
     except ValueError as e:

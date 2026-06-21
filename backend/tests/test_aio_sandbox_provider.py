@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import Paths, join_host_path
 from deerflow.runtime.user_context import reset_current_user, set_current_user
 
@@ -84,6 +85,115 @@ def test_get_thread_mounts_includes_user_data_dirs(tmp_path, monkeypatch):
     assert "/mnt/user-data/workspace" in container_paths
     assert "/mnt/user-data/uploads" in container_paths
     assert "/mnt/user-data/outputs" in container_paths
+
+
+def test_get_thread_mounts_object_runtime_skips_user_data_and_acp_mounts(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: None)
+
+    mounts = aio_mod.AioSandboxProvider._get_thread_mounts("thread-object")
+
+    assert mounts == []
+    assert not (tmp_path / "threads" / "thread-object").exists()
+
+
+def test_create_sandbox_materializes_object_runtime_after_ready(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._warm_pool = {}
+    provider._sandboxes = {}
+    provider._sandbox_infos = {}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {}
+    provider._config = {"replicas": 3}
+    provider._backend = SimpleNamespace(
+        create=MagicMock(return_value=aio_mod.SandboxInfo(sandbox_id="sandbox-object", sandbox_url="http://sandbox")),
+        destroy=MagicMock(),
+    )
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_get_extra_mounts", lambda _self, _thread_id: [])
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_materialize_thread_artifacts", lambda _self, thread_id, sandbox_id: calls.append((thread_id, sandbox_id)))
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda _url, timeout=60: True)
+
+    sandbox_id = provider._create_sandbox("thread-object", "sandbox-object")
+
+    assert sandbox_id == "sandbox-object"
+    assert calls == [("thread-object", "sandbox-object")]
+
+
+def test_discover_or_create_object_runtime_uses_advisory_lock_without_thread_dirs(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._discover_or_create_with_lock = aio_mod.AioSandboxProvider._discover_or_create_with_lock.__get__(
+        provider,
+        aio_mod.AioSandboxProvider,
+    )
+    provider._thread_sandboxes = {}
+    provider._warm_pool = {}
+    provider._sandbox_infos = {}
+    provider._sandboxes = {}
+    provider._last_activity = {}
+    provider._backend = SimpleNamespace(discover=MagicMock(return_value=None))
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
+    lock_events: list[str] = []
+
+    class FakeLock:
+        def __enter__(self):
+            lock_events.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_events.append("exit")
+
+    paths = MagicMock()
+    paths.ensure_thread_dirs.side_effect = AssertionError("object mode must not create lock-file directories")
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "get_paths", lambda: paths)
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: "user-1")
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_sandbox_creation_lock", lambda _self, thread_id, sandbox_id: FakeLock())
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_create_sandbox", lambda _self, thread_id, sandbox_id: "sandbox-object")
+
+    sandbox_id = provider._discover_or_create_with_lock("thread-object", "sandbox-object")
+
+    assert sandbox_id == "sandbox-object"
+    assert lock_events == ["enter", "exit"]
+    paths.ensure_thread_dirs.assert_not_called()
+
+
+def test_release_flushes_object_runtime_before_closing_sandbox(tmp_path, monkeypatch):
+    provider, sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-rel")
+    provider._thread_sandboxes = {"thread-object": "sandbox-rel"}
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj)))
+
+    provider.release("sandbox-rel")
+
+    assert calls == [("thread-object", sandbox)]
+    sandbox.close.assert_called_once_with()
 
 
 def test_get_thread_mounts_can_include_writable_db_skills_dir(tmp_path, monkeypatch):

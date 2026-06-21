@@ -388,6 +388,15 @@ class TestDownloadFile:
 
         assert result == b""
 
+    def test_allows_acp_workspace_downloads_for_runtime_flush(self, sandbox):
+        """Object-mode runtime flush must be able to persist ACP workspace files."""
+        sandbox._client.file.download_file = MagicMock(return_value=[b"{}"])
+
+        result = sandbox.download_file("/mnt/acp-workspace/subagent/result.json")
+
+        assert result == b"{}"
+        sandbox._client.file.download_file.assert_called_once_with(path="/mnt/acp-workspace/subagent/result.json")
+
     def test_uses_lock_during_download(self, sandbox):
         """download_file should hold the lock while calling the client."""
         lock_was_held = []

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import mimetypes
 import re
+import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
@@ -28,7 +29,9 @@ from app.channels.message_bus import (
 from app.channels.store import ChannelStore
 from app.gateway.csrf_middleware import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, generate_csrf_token
 from app.gateway.internal_auth import create_internal_auth_headers
+from deerflow.artifacts.store import ArtifactStore, make_artifact_store
 from deerflow.config.agents_config import load_agent_config
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import make_safe_user_id
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.skills.slash import parse_slash_skill_reference
@@ -474,6 +477,58 @@ def _format_artifact_text(artifacts: list[str]) -> str:
 _OUTPUTS_VIRTUAL_PREFIX = "/mnt/user-data/outputs/"
 
 
+def _get_runtime_artifact_store() -> ArtifactStore | None:
+    config = get_app_config()
+    if config.runtime_storage.backend != "object":
+        return None
+    return make_artifact_store(config.runtime_storage)
+
+
+def _filename_from_virtual_child_path(virtual_path: str, prefix: str) -> str | None:
+    if not virtual_path.startswith(prefix):
+        return None
+    filename = virtual_path.removeprefix(prefix)
+    if not filename or "/" in filename or "\\" in filename or Path(filename).name != filename:
+        return None
+    return filename
+
+
+def _attachment_from_object_store(
+    *,
+    artifact_store: ArtifactStore,
+    thread_id: str,
+    user_id: str,
+    virtual_path: str,
+) -> ResolvedAttachment | None:
+    if not virtual_path.startswith(_OUTPUTS_VIRTUAL_PREFIX):
+        logger.warning("[Manager] rejected non-outputs artifact path: %s", virtual_path)
+        return None
+    try:
+        data = artifact_store.get_bytes(user_id, thread_id, virtual_path)
+    except FileNotFoundError:
+        logger.warning("[Manager] artifact not found in object storage: %s", virtual_path)
+        return None
+    except (ValueError, OSError) as exc:
+        logger.warning("[Manager] failed to resolve object artifact %s: %s", virtual_path, exc)
+        return None
+
+    filename = Path(virtual_path).name
+    mime, _ = mimetypes.guess_type(filename)
+    mime = mime or "application/octet-stream"
+    suffix = Path(filename).suffix
+    with tempfile.NamedTemporaryFile(prefix="deerflow-artifact-", suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    return ResolvedAttachment(
+        virtual_path=virtual_path,
+        actual_path=tmp_path,
+        filename=filename,
+        mime_type=mime,
+        size=len(data),
+        is_image=mime.startswith("image/"),
+    )
+
+
 def _unknown_command_reply(command: str | None = None) -> str:
     available = " | ".join(sorted(KNOWN_CHANNEL_COMMANDS))
     if command:
@@ -589,11 +644,25 @@ def _resolve_attachments(thread_id: str, artifacts: list[str], *, user_id: str |
     Skips artifacts that cannot be resolved (missing files, invalid paths)
     and logs warnings for them.
     """
+    effective_user_id = user_id or get_effective_user_id()
+    artifact_store = _get_runtime_artifact_store()
+    if artifact_store is not None:
+        attachments: list[ResolvedAttachment] = []
+        for virtual_path in artifacts:
+            attachment = _attachment_from_object_store(
+                artifact_store=artifact_store,
+                thread_id=thread_id,
+                user_id=effective_user_id,
+                virtual_path=virtual_path,
+            )
+            if attachment is not None:
+                attachments.append(attachment)
+        return attachments
+
     from deerflow.config.paths import get_paths
 
     attachments: list[ResolvedAttachment] = []
     paths = get_paths()
-    effective_user_id = user_id or get_effective_user_id()
     outputs_dir = paths.sandbox_outputs_dir(thread_id, user_id=effective_user_id).resolve()
     for virtual_path in artifacts:
         # Security: only allow files from the agent outputs directory
@@ -670,14 +739,31 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage, *, user_id:
         write_upload_file_no_symlink,
     )
 
+    artifact_store = await asyncio.to_thread(_get_runtime_artifact_store)
+    effective_user_id = user_id or get_effective_user_id()
+
     def _prepare_uploads_dir() -> tuple[Path, set[str]]:
         # Worker thread: ensure_uploads_dir's mkdir and the iterdir enumeration are
         # blocking filesystem IO that must stay off the event loop.
-        target = ensure_uploads_dir(thread_id, user_id=user_id)
+        target = ensure_uploads_dir(thread_id, user_id=effective_user_id)
         existing = {entry.name for entry in target.iterdir() if entry.is_file()}
         return target, existing
 
-    uploads_dir, seen_names = await asyncio.to_thread(_prepare_uploads_dir)
+    if artifact_store is not None:
+        uploaded = await asyncio.to_thread(
+            artifact_store.list_files,
+            effective_user_id,
+            thread_id,
+            "/mnt/user-data/uploads",
+        )
+        seen_names = {
+            filename
+            for item in uploaded
+            if (filename := _filename_from_virtual_child_path(item.virtual_path, "/mnt/user-data/uploads/")) is not None
+        }
+        uploads_dir = None
+    else:
+        uploads_dir, seen_names = await asyncio.to_thread(_prepare_uploads_dir)
 
     created: list[dict[str, Any]] = []
     file_reader = INBOUND_FILE_READERS.get(msg.channel_name, _read_http_inbound_file)
@@ -723,15 +809,32 @@ async def _ingest_inbound_files(thread_id: str, msg: InboundMessage, *, user_id:
                 )
                 continue
 
-            dest = uploads_dir / safe_name
-            try:
-                dest = await asyncio.to_thread(write_upload_file_no_symlink, uploads_dir, safe_name, data)
-            except UnsafeUploadPathError:
-                logger.warning("[Manager] skipping inbound file with unsafe destination: %s", safe_name)
-                continue
-            except Exception:
-                logger.exception("[Manager] failed to write inbound file: %s", dest)
-                continue
+            if artifact_store is not None:
+                virtual_path = f"/mnt/user-data/uploads/{safe_name}"
+                content_type, _ = mimetypes.guess_type(safe_name)
+                try:
+                    await asyncio.to_thread(
+                        artifact_store.put_bytes,
+                        effective_user_id,
+                        thread_id,
+                        virtual_path,
+                        data,
+                        content_type=content_type,
+                    )
+                except Exception:
+                    logger.exception("[Manager] failed to write inbound file to object storage: %s", virtual_path)
+                    continue
+            else:
+                assert uploads_dir is not None
+                dest = uploads_dir / safe_name
+                try:
+                    dest = await asyncio.to_thread(write_upload_file_no_symlink, uploads_dir, safe_name, data)
+                except UnsafeUploadPathError:
+                    logger.warning("[Manager] skipping inbound file with unsafe destination: %s", safe_name)
+                    continue
+                except Exception:
+                    logger.exception("[Manager] failed to write inbound file: %s", dest)
+                    continue
 
             created.append(
                 {

@@ -23,6 +23,8 @@ from app.channels.message_bus import (
     ResolvedAttachment,
 )
 from app.channels.store import ChannelStore
+from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.config.app_config import AppConfig
 from deerflow.skills.types import Skill, SkillCategory
 from deerflow.utils.messages import ORIGINAL_USER_CONTENT_KEY
 
@@ -58,6 +60,22 @@ def _make_channel_skill_storage(skills: list[Skill]):
     return SimpleNamespace(
         load_skills=lambda *, enabled_only: [skill for skill in skills if skill.enabled] if enabled_only else skills,
         get_container_root=lambda: "/mnt/skills",
+    )
+
+
+def _object_runtime_config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": {"backend": "postgres", "postgres_url": "postgresql://user:pass@db/deerflow"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "endpoint_url": "http://seaweedfs:8333",
+                    "bucket": "deerflow-runtime",
+                },
+            },
+        }
     )
 
 
@@ -827,6 +845,52 @@ class TestChannelManager:
             ]
             assert (paths.sandbox_uploads_dir("thread-owner", user_id="owner-1") / "report.txt").read_bytes() == b"owner data"
             assert not paths.sandbox_uploads_dir("thread-owner").exists()
+
+        _run(go())
+
+    def test_ingest_inbound_files_object_runtime_writes_artifact_store(self, tmp_path, monkeypatch):
+        import app.channels.manager as manager_module
+        from app.channels.manager import INBOUND_FILE_READERS, _ingest_inbound_files
+        from deerflow.config.paths import Paths
+
+        store = InMemoryArtifactStore(prefix="deerflow")
+        paths = Paths(tmp_path)
+        monkeypatch.setattr(manager_module, "get_app_config", lambda: _object_runtime_config(), raising=False)
+        monkeypatch.setattr(manager_module, "make_artifact_store", lambda _config: store, raising=False)
+        monkeypatch.setattr("deerflow.uploads.manager.get_paths", lambda: paths)
+
+        async def read_file(file_info, client):
+            del file_info, client
+            return b"object data"
+
+        INBOUND_FILE_READERS["object-test"] = read_file
+
+        async def go():
+            try:
+                created = await _ingest_inbound_files(
+                    "thread-object",
+                    InboundMessage(
+                        channel_name="object-test",
+                        chat_id="C123",
+                        user_id="U-platform",
+                        text="file",
+                        files=[{"filename": "report.txt", "type": "file"}],
+                    ),
+                    user_id="owner-1",
+                )
+            finally:
+                INBOUND_FILE_READERS.pop("object-test", None)
+
+            assert created == [
+                {
+                    "filename": "report.txt",
+                    "size": len(b"object data"),
+                    "path": "/mnt/user-data/uploads/report.txt",
+                    "is_image": False,
+                }
+            ]
+            assert store.get_bytes("owner-1", "thread-object", "/mnt/user-data/uploads/report.txt") == b"object data"
+            assert not paths.sandbox_uploads_dir("thread-object", user_id="owner-1").exists()
 
         _run(go())
 
@@ -3528,6 +3592,28 @@ class TestExtractArtifacts:
             ]
         }
         assert _extract_artifacts(result) == ["/mnt/user-data/outputs/a.txt", "/mnt/user-data/outputs/b.csv"]
+
+    def test_resolve_attachments_object_runtime_reads_artifact_store(self, monkeypatch):
+        import app.channels.manager as manager_module
+        from app.channels.manager import _resolve_attachments
+
+        store = InMemoryArtifactStore(prefix="deerflow")
+        store.put_bytes("owner-1", "thread-object", "/mnt/user-data/outputs/report.txt", b"hello", content_type="text/plain")
+        monkeypatch.setattr(manager_module, "get_app_config", lambda: _object_runtime_config(), raising=False)
+        monkeypatch.setattr(manager_module, "make_artifact_store", lambda _config: store, raising=False)
+
+        attachments = _resolve_attachments("thread-object", ["/mnt/user-data/outputs/report.txt"], user_id="owner-1")
+
+        assert len(attachments) == 1
+        attachment = attachments[0]
+        try:
+            assert attachment.virtual_path == "/mnt/user-data/outputs/report.txt"
+            assert attachment.filename == "report.txt"
+            assert attachment.mime_type == "text/plain"
+            assert attachment.size == len(b"hello")
+            assert attachment.actual_path.read_bytes() == b"hello"
+        finally:
+            attachment.actual_path.unlink(missing_ok=True)
 
     def test_ignores_hidden_human_control_messages(self):
         """Hidden control messages should not hide current-turn present_files artifacts."""

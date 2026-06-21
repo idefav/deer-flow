@@ -11,7 +11,7 @@ change at runtime.
 The registry covers two kinds of entries:
 
 - Top-level ``AppConfig`` fields (``database``, ``checkpointer``,
-  ``run_events``, ``stream_bridge``, ``sandbox``, ``log_level``). For
+  ``run_events``, ``runtime_storage``, ``stream_bridge``, ``sandbox``, ``log_level``). For
   these, :func:`format_field_description` produces the standardised
   ``"startup-only: ..."`` prefix that the matching Pydantic
   ``Field(description=...)`` carries, so the boundary surfaces in IDE
@@ -46,6 +46,7 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
     "database": ("init_engine_from_config() runs once during langgraph_runtime() startup; the SQLAlchemy engine holds the connection pool and is not rebuilt on config.yaml edits."),
     "checkpointer": ("make_checkpointer() binds the persistent checkpointer once at startup, including SQLite WAL / busy_timeout settings."),
     "run_events": ("make_run_event_store() picks the memory- vs SQL-backed implementation at startup and is frozen onto app.state.run_events_config to stay paired with the underlying event store."),
+    "runtime_storage": ("runtime artifact storage is selected during sandbox/provider startup; switching between filesystem and object storage requires rebuilding the provider and its materialization cache."),
     "stream_bridge": ("make_stream_bridge() constructs the stream-bridge singleton once during startup."),
     "sandbox": ("get_sandbox_provider() caches the provider singleton (``_default_sandbox_provider``); a different ``sandbox.use`` class path only takes effect on next process start."),
     "log_level": (

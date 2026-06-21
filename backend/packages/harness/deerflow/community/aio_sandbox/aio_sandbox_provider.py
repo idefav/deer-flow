@@ -27,6 +27,9 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
     import msvcrt
 
+from deerflow.artifacts.sandbox_lock import make_sandbox_creation_lock
+from deerflow.artifacts.sandbox_materializer import SandboxArtifactMaterializer
+from deerflow.artifacts.store import make_artifact_store
 from deerflow.config import get_app_config
 from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
@@ -105,6 +108,13 @@ def _release_cancelled_lock_acquire(lock: threading.Lock, task: asyncio.Future[b
 
     if acquired:
         lock.release()
+
+
+def _object_runtime_storage_enabled() -> bool:
+    try:
+        return get_app_config().runtime_storage.backend == "object"
+    except Exception:
+        return False
 
 
 class AioSandboxProvider(SandboxProvider):
@@ -327,6 +337,11 @@ class AioSandboxProvider(SandboxProvider):
         """
         paths = get_paths()
         user_id = get_effective_user_id()
+        if _object_runtime_storage_enabled():
+            if include_db_skills_mount:
+                paths.ensure_thread_dirs(thread_id, user_id=user_id)
+                return [(paths.host_sandbox_skills_dir(thread_id, user_id=user_id), skills_container_path, False)]
+            return []
         paths.ensure_thread_dirs(thread_id, user_id=user_id)
 
         mounts = [
@@ -555,6 +570,7 @@ class AioSandboxProvider(SandboxProvider):
 
         suffix = " (post-lock check)" if post_lock else f" at {info.sandbox_url}"
         logger.info(f"Reclaimed warm-pool sandbox {sandbox_id} for thread {thread_id}{suffix}")
+        self._materialize_thread_artifacts(thread_id, sandbox_id)
         return sandbox_id
 
     def _recheck_cached_sandbox(self, thread_id: str, sandbox_id: str) -> str | None:
@@ -571,6 +587,7 @@ class AioSandboxProvider(SandboxProvider):
             self._thread_sandboxes[thread_id] = info.sandbox_id
 
         logger.info(f"Discovered existing sandbox {info.sandbox_id} for thread {thread_id} at {info.sandbox_url}")
+        self._materialize_thread_artifacts(thread_id, info.sandbox_id)
         return info.sandbox_id
 
     def _register_created_sandbox(self, thread_id: str | None, sandbox_id: str, info: SandboxInfo) -> str:
@@ -584,7 +601,32 @@ class AioSandboxProvider(SandboxProvider):
                 self._thread_sandboxes[thread_id] = sandbox_id
 
         logger.info(f"Created sandbox {sandbox_id} for thread {thread_id} at {info.sandbox_url}")
+        if thread_id is not None:
+            self._materialize_thread_artifacts(thread_id, sandbox_id)
         return sandbox_id
+
+    def _get_runtime_artifact_store(self):
+        if not _object_runtime_storage_enabled():
+            return None
+        config = get_app_config()
+        return make_artifact_store(config.runtime_storage)
+
+    def _materialize_thread_artifacts(self, thread_id: str, sandbox_id: str) -> None:
+        artifact_store = self._get_runtime_artifact_store()
+        if artifact_store is None:
+            return
+        sandbox = self.get(sandbox_id)
+        if sandbox is None:
+            return
+        user_id = str(get_effective_user_id())
+        SandboxArtifactMaterializer(artifact_store).materialize_thread(user_id, thread_id, sandbox)
+
+    def _flush_thread_artifacts(self, thread_id: str, sandbox: Sandbox) -> None:
+        artifact_store = self._get_runtime_artifact_store()
+        if artifact_store is None:
+            return
+        user_id = str(get_effective_user_id())
+        SandboxArtifactMaterializer(artifact_store).flush_thread(user_id, thread_id, sandbox)
 
     def _check_tracked_sandbox_alive(self, sandbox_id: str, info: SandboxInfo) -> bool | None:
         """Return whether a tracked sandbox appears alive, or None if unknown."""
@@ -764,6 +806,18 @@ class AioSandboxProvider(SandboxProvider):
         The file lock serializes concurrent sandbox creation for the same thread_id
         across multiple processes, preventing container-name conflicts.
         """
+        if _object_runtime_storage_enabled():
+            with self._sandbox_creation_lock(thread_id, sandbox_id):
+                cached_id = self._recheck_cached_sandbox(thread_id, sandbox_id)
+                if cached_id is not None:
+                    return cached_id
+
+                discovered = self._backend.discover(sandbox_id)
+                if discovered is not None:
+                    return self._register_discovered_sandbox(thread_id, discovered)
+
+                return self._create_sandbox(thread_id, sandbox_id)
+
         paths = get_paths()
         user_id = get_effective_user_id()
         paths.ensure_thread_dirs(thread_id, user_id=user_id)
@@ -792,6 +846,9 @@ class AioSandboxProvider(SandboxProvider):
 
     async def _discover_or_create_with_lock_async(self, thread_id: str, sandbox_id: str) -> str:
         """Async counterpart to ``_discover_or_create_with_lock``."""
+        if _object_runtime_storage_enabled():
+            return await asyncio.to_thread(self._discover_or_create_with_lock, thread_id, sandbox_id)
+
         paths = get_paths()
         user_id = get_effective_user_id()
         await asyncio.to_thread(paths.ensure_thread_dirs, thread_id, user_id=user_id)
@@ -819,6 +876,9 @@ class AioSandboxProvider(SandboxProvider):
             if locked:
                 await asyncio.to_thread(_unlock_file, lock_file)
             await asyncio.to_thread(lock_file.close)
+
+    def _sandbox_creation_lock(self, thread_id: str, sandbox_id: str):
+        return make_sandbox_creation_lock(get_app_config(), thread_id, sandbox_id)
 
     def _evict_oldest_warm(self) -> str | None:
         """Destroy the oldest container in the warm pool to free capacity.
@@ -937,6 +997,11 @@ class AioSandboxProvider(SandboxProvider):
                 self._warm_pool[sandbox_id] = (info, time.time())
 
         if sandbox is not None:
+            for thread_id in thread_ids_to_remove:
+                try:
+                    self._flush_thread_artifacts(thread_id, sandbox)
+                except Exception as e:
+                    logger.warning(f"Failed to flush runtime artifacts for thread {thread_id} before sandbox release: {e}")
             # Defense-in-depth: close() already swallows its own errors; this
             # guard only protects against a future close() that misbehaves, so
             # host-side client cleanup can never block parking in the warm pool.

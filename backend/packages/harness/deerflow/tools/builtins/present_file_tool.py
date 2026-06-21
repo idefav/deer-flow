@@ -6,6 +6,8 @@ from langchain_core.messages import ToolMessage
 from langgraph.config import get_config
 from langgraph.types import Command
 
+from deerflow.artifacts.store import ArtifactPathError, parse_artifact_virtual_path
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.tools.types import Runtime
@@ -28,6 +30,10 @@ def _get_thread_id(runtime: Runtime) -> str | None:
         return get_config().get("configurable", {}).get("thread_id")
     except RuntimeError:
         return None
+
+
+def _runtime_storage_is_object() -> bool:
+    return get_app_config().runtime_storage.backend == "object"
 
 
 def _normalize_presented_filepath(
@@ -60,9 +66,20 @@ def _normalize_presented_filepath(
     if not outputs_path:
         raise ValueError("Thread outputs path is not available in runtime state")
 
-    outputs_dir = Path(outputs_path).resolve()
     stripped = filepath.lstrip("/")
     virtual_prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
+    if _runtime_storage_is_object():
+        if not (stripped == virtual_prefix or stripped.startswith(virtual_prefix + "/")):
+            raise ValueError(f"Only files in {OUTPUTS_VIRTUAL_PREFIX} can be presented: {filepath}")
+        try:
+            parsed = parse_artifact_virtual_path(f"/{stripped}")
+        except ArtifactPathError as exc:
+            raise ValueError(f"Only files in {OUTPUTS_VIRTUAL_PREFIX} can be presented: {filepath}") from exc
+        if parsed.scope != "outputs":
+            raise ValueError(f"Only files in {OUTPUTS_VIRTUAL_PREFIX} can be presented: {filepath}")
+        return parsed.virtual_path
+
+    outputs_dir = Path(outputs_path).resolve()
 
     if stripped == virtual_prefix or stripped.startswith(virtual_prefix + "/"):
         try:

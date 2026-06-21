@@ -36,6 +36,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3.0",
     "aiosqlite>=0.19",
     "alembic>=1.13",
+    "boto3>=1.35.0",
     "cryptography>=43.0.0",
 ]
 

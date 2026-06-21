@@ -95,6 +95,37 @@ class TestBuildVolumes:
         assert volumes[1].host_path.path == "/host/thread/skills"
         assert volumes[1].host_path.type == "DirectoryOrCreate"
 
+    def test_object_runtime_omits_userdata_volume(self, provisioner_module):
+        """Object runtime storage must not create a user-data PVC or hostPath volume."""
+        provisioner_module.RUNTIME_STORAGE_BACKEND = "object"
+        provisioner_module.USERDATA_PVC_NAME = ""
+
+        volumes = provisioner_module._build_volumes("thread-1")
+
+        assert [volume.name for volume in volumes] == ["skills"]
+
+    def test_object_runtime_rejects_userdata_pvc(self, provisioner_module):
+        """Object runtime storage must fail closed if USERDATA_PVC_NAME is still set."""
+        provisioner_module.RUNTIME_STORAGE_BACKEND = "object"
+        provisioner_module.USERDATA_PVC_NAME = "userdata-pvc"
+
+        with pytest.raises(RuntimeError, match="USERDATA_PVC_NAME"):
+            provisioner_module._build_volumes("thread-1")
+
+    def test_object_runtime_rejects_extra_userdata_mount(self, provisioner_module):
+        """Object runtime storage must not accept request-scoped user-data mounts."""
+        provisioner_module.RUNTIME_STORAGE_BACKEND = "object"
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/user-data",
+                container_path="/mnt/user-data",
+                read_only=False,
+            )
+        ]
+
+        with pytest.raises(RuntimeError, match="/mnt/user-data"):
+            provisioner_module._build_volumes("thread-1", extra_mounts=extra_mounts)
+
 
 # ── _build_volume_mounts ───────────────────────────────────────────────
 
@@ -165,6 +196,14 @@ class TestBuildVolumeMounts:
         assert mounts[1].name == "extra-mount-0"
         assert mounts[1].read_only is False
 
+    def test_object_runtime_omits_userdata_mount(self, provisioner_module):
+        provisioner_module.RUNTIME_STORAGE_BACKEND = "object"
+        provisioner_module.USERDATA_PVC_NAME = ""
+
+        mounts = provisioner_module._build_volume_mounts("thread-1")
+
+        assert [mount.mount_path for mount in mounts] == ["/mnt/skills"]
+
 
 # ── _build_pod integration ─────────────────────────────────────────────
 
@@ -211,6 +250,15 @@ class TestBuildPodVolumes:
         assert [volume.name for volume in pod.spec.volumes] == ["user-data", "extra-mount-0"]
         assert [mount.mount_path for mount in pod.spec.containers[0].volume_mounts] == ["/mnt/user-data", "/mnt/skills"]
         assert pod.spec.containers[0].volume_mounts[1].read_only is False
+
+    def test_object_runtime_pod_has_no_userdata_volume_or_mount(self, provisioner_module):
+        provisioner_module.RUNTIME_STORAGE_BACKEND = "object"
+        provisioner_module.USERDATA_PVC_NAME = ""
+
+        pod = provisioner_module._build_pod("sandbox-1", "thread-1")
+
+        assert [volume.name for volume in pod.spec.volumes] == ["skills"]
+        assert [mount.mount_path for mount in pod.spec.containers[0].volume_mounts] == ["/mnt/skills"]
 
     def test_pod_records_mount_contract_hash(self, provisioner_module):
         """Pod annotations should record the mount contract used for idempotent reuse."""

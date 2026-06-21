@@ -314,6 +314,71 @@ The bundled provisioner records a mount-contract hash on each sandbox Pod. If `P
 
 `RemoteSandboxBackend` includes the provisioner response body in create-failure errors, so remote smoke output should preserve the HTTP 409 mount-contract detail.
 
+## Runtime PVC Removal With Object Storage
+
+Runtime workspace files are separate from DB-backed control state. To remove the sandbox runtime PVC completely, enable object-backed runtime storage for `/mnt/user-data/workspace`, `/mnt/user-data/uploads`, `/mnt/user-data/outputs`, and `/mnt/acp-workspace`.
+
+Recommended open-source S3-compatible stores:
+
+- **SeaweedFS S3 Gateway**: lightweight, easy to run in Kubernetes, good fit for per-thread runtime artifacts.
+- **MinIO**: mature S3-compatible object storage with strong operational tooling.
+- **Ceph RGW**: appropriate when the platform already runs Ceph.
+
+Backend config:
+
+```yaml
+runtime_storage:
+  backend: object
+  object_store:
+    provider: s3
+    endpoint_url: http://seaweedfs-s3:8333
+    bucket: deerflow-runtime
+    region: us-east-1
+    prefix: deerflow
+    path_style: true
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+```
+
+Provisioner config:
+
+```bash
+RUNTIME_STORAGE_BACKEND=object
+unset USERDATA_PVC_NAME
+```
+
+In object mode, the bundled provisioner fails closed if `USERDATA_PVC_NAME` is still set or if request-scoped extra mounts target `/mnt/user-data` or `/mnt/acp-workspace`. Sandbox Pods keep the skills mount, but runtime workspace/upload/output/ACP files are materialized through the AIO file API from object storage and flushed back before release.
+
+Before switching production traffic, import existing runtime PVC or `.deer-flow` files:
+
+```bash
+uv --directory backend run python scripts/import_runtime_artifacts_to_object_store.py \
+  --state-dir /path/to/.deer-flow \
+  --dry-run \
+  --json
+
+uv --directory backend run python scripts/import_runtime_artifacts_to_object_store.py \
+  --state-dir /path/to/.deer-flow \
+  --json
+```
+
+The importer supports both user-isolated `users/{user}/threads/{thread}/...` layout and legacy `threads/{thread}/...` layout. Legacy threads are imported under owner `default`.
+
+Run the static object-storage gate before live sign-off:
+
+```bash
+RUNTIME_STORAGE_BACKEND=object \
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate runtime_object_storage --json
+```
+
+Production sign-off still requires live evidence. After the static gate passes, run remote/model gates and validate evidence:
+
+```bash
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate remote_live --run --evidence-path <bundle>/evidence.json --evidence-log-dir logs
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate requires_llm --run --evidence-path <bundle>/evidence.json --evidence-log-dir logs
+uv --directory backend run python scripts/check_stateless_live_gates.py --validate-evidence <bundle>/evidence.json --require-run --require-logs --json
+```
+
 ## Post-Migration Checks
 
 Run these checks before sending production traffic:

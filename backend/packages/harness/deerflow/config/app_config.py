@@ -24,6 +24,7 @@ from deerflow.config.model_config import ModelConfig
 from deerflow.config.reload_boundary import format_field_description
 from deerflow.config.run_events_config import RunEventsConfig
 from deerflow.config.runtime_paths import existing_project_file
+from deerflow.config.runtime_storage_config import RuntimeStorageConfig
 from deerflow.config.safety_finish_reason_config import SafetyFinishReasonConfig
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.config.skill_evolution_config import SkillEvolutionConfig
@@ -143,6 +144,13 @@ class AppConfig(BaseModel):
         description=format_field_description(
             "run_events",
             field_doc="Run-event store backend (memory for dev, db for production queries, jsonl for lightweight single-node persistence).",
+        ),
+    )
+    runtime_storage: RuntimeStorageConfig = Field(
+        default_factory=RuntimeStorageConfig,
+        description=format_field_description(
+            "runtime_storage",
+            field_doc="Runtime workspace/upload/output artifact storage backend (filesystem for local/PVC compatibility, object for stateless S3-compatible storage).",
         ),
     )
     checkpointer: CheckpointerConfig | None = Field(

@@ -9,10 +9,21 @@ from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
 from deerflow.agents.thread_state import ThreadDataState
+from deerflow.config.app_config import get_app_config
 from deerflow.config.paths import Paths, get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 
 logger = logging.getLogger(__name__)
+
+_VIRTUAL_THREAD_PATHS = {
+    "workspace_path": "/mnt/user-data/workspace",
+    "uploads_path": "/mnt/user-data/uploads",
+    "outputs_path": "/mnt/user-data/outputs",
+}
+
+
+def _runtime_storage_is_object() -> bool:
+    return get_app_config().runtime_storage.backend == "object"
 
 
 class ThreadDataMiddlewareState(AgentState):
@@ -59,6 +70,9 @@ class ThreadDataMiddleware(AgentMiddleware[ThreadDataMiddlewareState]):
         Returns:
             Dictionary with workspace_path, uploads_path, and outputs_path.
         """
+        if _runtime_storage_is_object():
+            return dict(_VIRTUAL_THREAD_PATHS)
+
         return {
             "workspace_path": str(self._paths.sandbox_work_dir(thread_id, user_id=user_id)),
             "uploads_path": str(self._paths.sandbox_uploads_dir(thread_id, user_id=user_id)),
@@ -75,6 +89,9 @@ class ThreadDataMiddleware(AgentMiddleware[ThreadDataMiddlewareState]):
         Returns:
             Dictionary with the created directory paths.
         """
+        if _runtime_storage_is_object():
+            return self._get_thread_paths(thread_id, user_id=user_id)
+
         self._paths.ensure_thread_dirs(thread_id, user_id=user_id)
         return self._get_thread_paths(thread_id, user_id=user_id)
 
