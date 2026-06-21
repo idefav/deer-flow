@@ -1731,6 +1731,35 @@ class TestUploads:
         assert delete_result["success"] is True
         assert after_delete["count"] == 0
 
+    def test_object_runtime_upload_converts_documents_to_artifact_store(self, client, tmp_path):
+        store = InMemoryArtifactStore(prefix="deerflow")
+        src_file = tmp_path / "report.pdf"
+        src_file.write_bytes(b"pdf-bytes")
+
+        async def fake_convert(path: Path) -> Path:
+            assert path.name == "report.pdf"
+            md_path = path.with_suffix(".md")
+            md_path.write_text("converted markdown", encoding="utf-8")
+            return md_path
+
+        with (
+            patch("deerflow.client.get_app_config", return_value=_object_runtime_config()),
+            patch("deerflow.client.make_artifact_store", return_value=store),
+            patch("deerflow.client.ensure_uploads_dir", side_effect=AssertionError("object mode must not create uploads dir")),
+            patch("deerflow.utils.file_conversion.CONVERTIBLE_EXTENSIONS", {".pdf"}),
+            patch("deerflow.utils.file_conversion.convert_file_to_markdown", side_effect=fake_convert),
+        ):
+            result = client.upload_files("thread-object", [src_file])
+
+        user_id = get_effective_user_id()
+        file_info = result["files"][0]
+        assert file_info["markdown_file"] == "report.md"
+        assert file_info["markdown_path"] == "/mnt/user-data/uploads/report.md"
+        assert file_info["markdown_virtual_path"] == "/mnt/user-data/uploads/report.md"
+        assert file_info["markdown_artifact_url"] == "/api/threads/thread-object/artifacts/mnt/user-data/uploads/report.md"
+        assert store.get_bytes(user_id, "thread-object", "/mnt/user-data/uploads/report.pdf") == b"pdf-bytes"
+        assert store.get_bytes(user_id, "thread-object", "/mnt/user-data/uploads/report.md") == b"converted markdown"
+
 
 # ---------------------------------------------------------------------------
 # Artifacts

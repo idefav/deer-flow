@@ -105,6 +105,28 @@ def test_acp_agent_config_auto_approve_permissions():
     assert cfg.auto_approve_permissions is True
 
 
+def test_acp_agent_config_defaults_to_gateway_execution_mode():
+    cfg = ACPAgentConfig(command="my-agent", description="desc")
+
+    assert cfg.execution_mode == "gateway"
+    assert cfg.sandbox_scope == "isolated"
+    assert cfg.sandbox_profile is None
+
+
+def test_acp_agent_config_accepts_sandbox_execution_mode():
+    cfg = ACPAgentConfig(
+        command="my-agent",
+        description="desc",
+        execution_mode="sandbox",
+        sandbox_scope="isolated",
+        sandbox_profile="codex",
+    )
+
+    assert cfg.execution_mode == "sandbox"
+    assert cfg.sandbox_scope == "isolated"
+    assert cfg.sandbox_profile == "codex"
+
+
 def test_acp_agent_config_missing_command_raises():
     with pytest.raises(ValidationError):
         ACPAgentConfig(description="No command provided")

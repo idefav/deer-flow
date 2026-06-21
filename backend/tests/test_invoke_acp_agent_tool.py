@@ -1,12 +1,18 @@
 """Tests for the built-in ACP invocation tool."""
 
 import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from deerflow.artifacts.store import InMemoryArtifactStore
 from deerflow.config.acp_config import ACPAgentConfig
+from deerflow.config.app_config import AppConfig
 from deerflow.config.extensions_config import ExtensionsConfig, McpServerConfig, set_extensions_config
+from deerflow.config.runtime_storage_config import ObjectStoreConfig, RuntimeStorageConfig
+from deerflow.tools.builtins import invoke_acp_agent_tool as acp_tool_module
 from deerflow.tools.builtins.invoke_acp_agent_tool import (
     _build_acp_mcp_servers,
     _build_mcp_servers,
@@ -120,6 +126,336 @@ def test_build_permission_response_denies_when_auto_approve_false():
 
 
 @pytest.mark.anyio
+async def test_invoke_acp_agent_sandbox_mode_uses_ephemeral_sandbox(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        def acquire_ephemeral(self, name: str, profile: str | None = None) -> str:
+            captured["acquire_ephemeral"] = (name, profile)
+            return "sandbox-acp"
+
+        def get(self, sandbox_id: str):
+            captured["get"] = sandbox_id
+            return SimpleNamespace(id=sandbox_id)
+
+        def release(self, sandbox_id: str) -> None:
+            captured["release"] = sandbox_id
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self._chunks: list[str] = []
+
+        @property
+        def collected_text(self) -> str:
+            return "".join(self._chunks)
+
+        async def session_update(self, session_id: str, update, **kwargs) -> None:
+            if hasattr(update, "content") and hasattr(update.content, "text"):
+                self._chunks.append(update.content.text)
+
+        async def request_permission(self, options, session_id: str, tool_call, **kwargs):
+            raise AssertionError("request_permission should not be called in this test")
+
+    class DummyConn:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def initialize(self, **kwargs):
+            captured["initialize"] = kwargs
+
+        async def new_session(self, **kwargs):
+            captured["new_session"] = kwargs
+            return SimpleNamespace(session_id="session-1")
+
+        async def prompt(self, **kwargs):
+            captured["prompt"] = kwargs
+            await self._client.session_update(
+                "session-1",
+                SimpleNamespace(content=text_content_block("ACP result")),
+            )
+
+    @asynccontextmanager
+    async def fake_spawn_sandbox_agent_process(client, sandbox, cmd, *args, env=None, cwd=None):
+        captured["spawn"] = {
+            "sandbox": sandbox,
+            "cmd": cmd,
+            "args": list(args),
+            "env": env,
+            "cwd": cwd,
+        }
+        yield DummyConn(client), object()
+
+    monkeypatch.setattr(acp_tool_module, "get_sandbox_provider", lambda: FakeProvider(), raising=False)
+    monkeypatch.setattr(acp_tool_module, "_spawn_sandbox_agent_process", fake_spawn_sandbox_agent_process, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "acp",
+        SimpleNamespace(
+            PROTOCOL_VERSION="2026-03-24",
+            Client=DummyClient,
+            text_block=lambda text: {"type": "text", "text": text},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "acp.schema",
+        SimpleNamespace(
+            ClientCapabilities=lambda: {"supports": []},
+            Implementation=lambda **kwargs: kwargs,
+            TextContentBlock=type(
+                "TextContentBlock",
+                (),
+                {"__init__": lambda self, text: setattr(self, "text", text)},
+            ),
+        ),
+    )
+    text_content_block = sys.modules["acp.schema"].TextContentBlock
+
+    tool = build_invoke_acp_agent_tool(
+        {
+            "codex": ACPAgentConfig(
+                command="codex-acp",
+                args=["--json"],
+                description="Codex CLI",
+                execution_mode="sandbox",
+                sandbox_profile="codex",
+                env={"OPENAI_API_KEY": "sk-test"},
+            )
+        }
+    )
+
+    try:
+        result = await tool.coroutine(agent="codex", prompt="Implement the fix")
+    finally:
+        sys.modules.pop("acp", None)
+        sys.modules.pop("acp.schema", None)
+
+    assert result == "ACP result"
+    assert captured["acquire_ephemeral"] == ("codex", "codex")
+    assert captured["get"] == "sandbox-acp"
+    assert captured["release"] == "sandbox-acp"
+    assert captured["spawn"] == {
+        "sandbox": SimpleNamespace(id="sandbox-acp"),
+        "cmd": "codex-acp",
+        "args": ["--json"],
+        "env": {"OPENAI_API_KEY": "sk-test"},
+        "cwd": "/mnt/acp-workspace",
+    }
+    assert captured["new_session"]["cwd"] == "/mnt/acp-workspace"
+    assert captured["prompt"] == {
+        "session_id": "session-1",
+        "prompt": [{"type": "text", "text": "Implement the fix"}],
+    }
+
+
+@pytest.mark.anyio
+async def test_invoke_acp_agent_sandbox_mode_materializes_and_flushes_acp_workspace(monkeypatch):
+    captured: dict[str, object] = {}
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/acp-workspace/input.txt", b"input")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/outputs/leader.txt", b"leader")
+
+    class FakeSandbox:
+        def __init__(self) -> None:
+            self.files: dict[str, bytes] = {}
+
+        def create_dir(self, path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+            captured.setdefault("created_dirs", []).append(path)
+
+        def update_file(self, path: str, content: bytes) -> None:
+            self.files[path] = content
+
+        def list_dir(self, path: str, max_depth: int = 8) -> list[str]:
+            return [item for item in self.files if item == path or item.startswith(f"{path.rstrip('/')}/")]
+
+        def download_file(self, path: str) -> bytes:
+            return self.files[path]
+
+    sandbox = FakeSandbox()
+    leader_sandbox = FakeSandbox()
+
+    class FakeProvider:
+        def acquire_ephemeral(self, name: str, profile: str | None = None) -> str:
+            captured["acquire_ephemeral"] = (name, profile)
+            return "sandbox-acp"
+
+        def get(self, sandbox_id: str):
+            captured["get"] = sandbox_id
+            return sandbox
+
+        def release(self, sandbox_id: str) -> None:
+            captured["release"] = sandbox_id
+
+        def refresh_thread_artifacts(self, thread_id: str, *, roots=None) -> bool:
+            captured["refresh_thread_artifacts"] = (thread_id, roots)
+            acp_tool_module.SandboxArtifactMaterializer(store).materialize_thread(
+                "user-1",
+                thread_id,
+                leader_sandbox,
+                roots=roots,
+            )
+            return True
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self._chunks: list[str] = []
+
+        @property
+        def collected_text(self) -> str:
+            return "".join(self._chunks)
+
+        async def session_update(self, session_id: str, update, **kwargs) -> None:
+            self._chunks.append(update.content.text)
+
+        async def request_permission(self, options, session_id: str, tool_call, **kwargs):
+            raise AssertionError("request_permission should not be called in this test")
+
+    class DummyConn:
+        def __init__(self, client) -> None:
+            self._client = client
+
+        async def initialize(self, **kwargs):
+            pass
+
+        async def new_session(self, **kwargs):
+            return SimpleNamespace(session_id="session-1")
+
+        async def prompt(self, **kwargs):
+            captured["materialized"] = dict(sandbox.files)
+            sandbox.files.pop("/mnt/acp-workspace/input.txt", None)
+            sandbox.files["/mnt/acp-workspace/result.txt"] = b"result"
+            await self._client.session_update(
+                "session-1",
+                SimpleNamespace(content=text_content_block("ACP result")),
+            )
+
+    @asynccontextmanager
+    async def fake_spawn_sandbox_agent_process(client, sandbox, cmd, *args, env=None, cwd=None):
+        yield DummyConn(client), object()
+
+    runtime_storage = RuntimeStorageConfig(
+        backend="object",
+        object_store=ObjectStoreConfig(bucket="runtime"),
+    )
+    monkeypatch.setattr(acp_tool_module, "get_app_config", lambda: SimpleNamespace(runtime_storage=runtime_storage), raising=False)
+    monkeypatch.setattr(acp_tool_module, "make_artifact_store", lambda _runtime_storage: store, raising=False)
+    monkeypatch.setattr(acp_tool_module, "get_effective_user_id", lambda: "user-1", raising=False)
+    monkeypatch.setattr(acp_tool_module, "get_sandbox_provider", lambda: FakeProvider(), raising=False)
+    monkeypatch.setattr(acp_tool_module, "_spawn_sandbox_agent_process", fake_spawn_sandbox_agent_process, raising=False)
+    monkeypatch.setattr(acp_tool_module, "_build_acp_mcp_servers", lambda: [], raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "acp",
+        SimpleNamespace(
+            PROTOCOL_VERSION="2026-03-24",
+            Client=DummyClient,
+            text_block=lambda text: {"type": "text", "text": text},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "acp.schema",
+        SimpleNamespace(
+            ClientCapabilities=lambda: {"supports": []},
+            Implementation=lambda **kwargs: kwargs,
+            TextContentBlock=type(
+                "TextContentBlock",
+                (),
+                {"__init__": lambda self, text: setattr(self, "text", text)},
+            ),
+        ),
+    )
+    text_content_block = sys.modules["acp.schema"].TextContentBlock
+
+    tool = build_invoke_acp_agent_tool(
+        {
+            "codex": ACPAgentConfig(
+                command="codex-acp",
+                description="Codex CLI",
+                execution_mode="sandbox",
+                sandbox_profile="codex",
+            )
+        }
+    )
+
+    try:
+        result = await tool.coroutine(
+            agent="codex",
+            prompt="Use input",
+            config={"configurable": {"thread_id": "thread-1"}},
+        )
+    finally:
+        sys.modules.pop("acp", None)
+        sys.modules.pop("acp.schema", None)
+
+    assert result == "ACP result"
+    assert captured["materialized"]["/mnt/acp-workspace/input.txt"] == b"input"
+    assert store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/result.txt") == b"result"
+    assert store.get_bytes("user-1", "thread-1", "/mnt/user-data/outputs/leader.txt") == b"leader"
+    assert captured["refresh_thread_artifacts"] == ("thread-1", ("/mnt/acp-workspace",))
+    assert leader_sandbox.files["/mnt/acp-workspace/result.txt"] == b"result"
+    assert "/mnt/user-data/outputs/leader.txt" not in leader_sandbox.files
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/input.txt")
+
+
+@pytest.mark.anyio
+async def test_invoke_acp_agent_sandbox_object_mode_requires_thread_id(monkeypatch):
+    runtime_storage = RuntimeStorageConfig(
+        backend="object",
+        object_store=ObjectStoreConfig(bucket="runtime"),
+    )
+
+    monkeypatch.setattr(acp_tool_module, "get_app_config", lambda: SimpleNamespace(runtime_storage=runtime_storage), raising=False)
+    monkeypatch.setattr(
+        acp_tool_module,
+        "get_sandbox_provider",
+        lambda: (_ for _ in ()).throw(AssertionError("sandbox should not be acquired without thread_id")),
+        raising=False,
+    )
+    monkeypatch.setattr(acp_tool_module, "_build_acp_mcp_servers", lambda: [], raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "acp",
+        SimpleNamespace(
+            PROTOCOL_VERSION="2026-03-24",
+            Client=object,
+            text_block=lambda text: {"type": "text", "text": text},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "acp.schema",
+        SimpleNamespace(
+            ClientCapabilities=lambda: {"supports": []},
+            Implementation=lambda **kwargs: kwargs,
+        ),
+    )
+
+    tool = build_invoke_acp_agent_tool(
+        {
+            "codex": ACPAgentConfig(
+                command="codex-acp",
+                description="Codex CLI",
+                execution_mode="sandbox",
+                sandbox_profile="codex",
+            )
+        }
+    )
+
+    try:
+        result = await tool.coroutine(agent="codex", prompt="Use object-backed ACP")
+    finally:
+        sys.modules.pop("acp", None)
+        sys.modules.pop("acp.schema", None)
+
+    assert (
+        result
+        == "Error invoking ACP agent 'codex': object-backed ACP workspace requires thread_id for durable artifact ownership"
+    )
+
+
+@pytest.mark.anyio
 async def test_build_invoke_tool_description_and_unknown_agent_error():
     tool = build_invoke_acp_agent_tool(
         {
@@ -171,6 +507,40 @@ def test_get_work_dir_falls_back_to_global_for_invalid_thread_id(monkeypatch, tm
     expected = tmp_path / "acp-workspace"
     assert result == str(expected)
     assert expected.exists()
+
+
+def test_acp_workspace_context_object_runtime_materializes_and_flushes_artifact_store(monkeypatch, tmp_path):
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/acp-workspace/keep.txt", b"old")
+    store.put_bytes("user-1", "thread-1", "/mnt/acp-workspace/delete.txt", b"delete")
+
+    monkeypatch.setattr(acp_tool_module, "get_app_config", lambda: config, raising=False)
+    monkeypatch.setattr(acp_tool_module, "make_artifact_store", lambda _runtime_storage: store, raising=False)
+    monkeypatch.setattr(acp_tool_module, "get_effective_user_id", lambda: "user-1", raising=False)
+
+    workspace_context = getattr(acp_tool_module, "_acp_workspace_context")
+    with workspace_context("thread-1") as cwd:
+        cwd_path = Path(cwd)
+        assert tmp_path not in cwd_path.parents
+        assert (cwd_path / "keep.txt").read_bytes() == b"old"
+        (cwd_path / "keep.txt").write_bytes(b"new")
+        (cwd_path / "delete.txt").unlink()
+        (cwd_path / "nested").mkdir()
+        (cwd_path / "nested" / "result.json").write_bytes(b'{"ok": true}')
+
+    assert store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/keep.txt") == b"new"
+    assert store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/nested/result.json") == b'{"ok": true}'
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/delete.txt")
 
 
 @pytest.mark.anyio

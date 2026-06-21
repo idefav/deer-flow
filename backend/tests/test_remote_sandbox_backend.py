@@ -128,10 +128,11 @@ def test_create_delegates_to_provisioner_create(monkeypatch):
     backend = RemoteSandboxBackend("http://provisioner:8002")
     expected = SandboxInfo(sandbox_id="abc123", sandbox_url="http://k3s:31001")
 
-    def mock_create(thread_id: str, sandbox_id: str, extra_mounts=None):
+    def mock_create(thread_id: str, sandbox_id: str, extra_mounts=None, options=None):
         assert thread_id == "thread-1"
         assert sandbox_id == "abc123"
         assert extra_mounts == [("/host", "/container", False)]
+        assert options is None
         return expected
 
     monkeypatch.setattr(backend, "_provisioner_create", mock_create)
@@ -158,6 +159,45 @@ def test_provisioner_create_returns_sandbox_info(monkeypatch):
     info = backend._provisioner_create("thread-1", "abc123")
     assert info.sandbox_id == "abc123"
     assert info.sandbox_url == "http://k3s:31001"
+
+
+def test_provisioner_create_forwards_create_options(monkeypatch):
+    from deerflow.community.aio_sandbox.backend import SandboxCreateOptions
+
+    backend = RemoteSandboxBackend("http://provisioner:8002")
+    captured: dict[str, object] = {}
+
+    def mock_post(url: str, json: dict, timeout: int):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _StubResponse(payload={"sandbox_id": "abc123", "sandbox_url": "http://k3s:31001"})
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    info = backend.create(
+        "thread-1",
+        "abc123",
+        options=SandboxCreateOptions(
+            name="codex",
+            image="registry.local/codex-acp:latest",
+            labels={"deerflow.acp.agent": "codex"},
+            ephemeral=True,
+        ),
+    )
+
+    assert info.sandbox_id == "abc123"
+    assert captured["url"] == "http://provisioner:8002/api/sandboxes"
+    assert captured["json"] == {
+        "sandbox_id": "abc123",
+        "thread_id": "thread-1",
+        "user_id": "test-user-autouse",
+        "name": "codex",
+        "image": "registry.local/codex-acp:latest",
+        "labels": {"deerflow.acp.agent": "codex"},
+        "ephemeral": True,
+    }
+    assert captured["timeout"] == 30
 
 
 def test_provisioner_create_accepts_anonymous_thread_id(monkeypatch):

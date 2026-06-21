@@ -230,6 +230,10 @@ class CreateSandboxRequest(BaseModel):
     thread_id: str = Field(pattern=SAFE_THREAD_ID_PATTERN)
     user_id: str = Field(default=DEFAULT_USER_ID, pattern=SAFE_USER_ID_PATTERN)
     extra_mounts: list[ExtraMount] = Field(default_factory=list)
+    name: str | None = None
+    image: str | None = None
+    labels: dict[str, str] = Field(default_factory=dict)
+    ephemeral: bool = False
 
 
 class SandboxResponse(BaseModel):
@@ -282,9 +286,20 @@ def _validate_runtime_storage_config(extra_mounts: list[ExtraMount] | None = Non
             raise RuntimeError(f"RUNTIME_STORAGE_BACKEND=object forbids extra mount at {mount.container_path}")
 
 
-def _mount_contract_payload(extra_mounts: list[ExtraMount] | None = None) -> list[dict[str, object]]:
+def _mount_contract_payload(
+    extra_mounts: list[ExtraMount] | None = None,
+    *,
+    name: str | None = None,
+    image: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> list[dict[str, object]]:
     return [
         {"runtime_storage_backend": RUNTIME_STORAGE_BACKEND},
+        *([{"name": name}] if name else []),
+        *([{"image": image}] if image else []),
+        *([{"labels": dict(sorted(labels.items()))}] if labels else []),
+        *([{"ephemeral": True}] if ephemeral else []),
         *[
             {
                 "host_path": mount.host_path,
@@ -296,15 +311,45 @@ def _mount_contract_payload(extra_mounts: list[ExtraMount] | None = None) -> lis
     ]
 
 
-def _mount_contract_hash(extra_mounts: list[ExtraMount] | None = None) -> str:
-    payload = json.dumps(_mount_contract_payload(extra_mounts), sort_keys=True, separators=(",", ":"))
+def _mount_contract_hash(
+    extra_mounts: list[ExtraMount] | None = None,
+    *,
+    name: str | None = None,
+    image: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> str:
+    payload = json.dumps(
+        _mount_contract_payload(
+            extra_mounts,
+            name=name,
+            image=image,
+            labels=labels,
+            ephemeral=ephemeral,
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _mount_contract_annotations(extra_mounts: list[ExtraMount] | None = None) -> dict[str, str]:
+def _mount_contract_annotations(
+    extra_mounts: list[ExtraMount] | None = None,
+    *,
+    name: str | None = None,
+    image: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> dict[str, str]:
     container_paths = ",".join(mount.container_path for mount in extra_mounts or [])
     return {
-        MOUNT_CONTRACT_HASH_ANNOTATION: _mount_contract_hash(extra_mounts),
+        MOUNT_CONTRACT_HASH_ANNOTATION: _mount_contract_hash(
+            extra_mounts,
+            name=name,
+            image=image,
+            labels=labels,
+            ephemeral=ephemeral,
+        ),
         MOUNT_CONTRACT_PATHS_ANNOTATION: container_paths,
     }
 
@@ -315,8 +360,22 @@ def _read_pod_mount_contract_hash(sandbox_id: str) -> str | None:
     return annotations.get(MOUNT_CONTRACT_HASH_ANNOTATION)
 
 
-def _ensure_existing_mount_contract(sandbox_id: str, extra_mounts: list[ExtraMount]) -> None:
-    expected_hash = _mount_contract_hash(extra_mounts)
+def _ensure_existing_mount_contract(
+    sandbox_id: str,
+    extra_mounts: list[ExtraMount],
+    *,
+    name: str | None = None,
+    image: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> None:
+    expected_hash = _mount_contract_hash(
+        extra_mounts,
+        name=name,
+        image=image,
+        labels=labels,
+        ephemeral=ephemeral,
+    )
     try:
         actual_hash = _read_pod_mount_contract_hash(sandbox_id)
     except ApiException as exc:
@@ -325,7 +384,8 @@ def _ensure_existing_mount_contract(sandbox_id: str, extra_mounts: list[ExtraMou
             detail=f"Failed to read existing sandbox Pod mount contract: {exc.reason}",
         ) from exc
 
-    if actual_hash is None and not extra_mounts and not _runtime_storage_object_mode():
+    has_create_options = bool(name or image or labels or ephemeral)
+    if actual_hash is None and not extra_mounts and not _runtime_storage_object_mode() and not has_create_options:
         return
     if actual_hash == expected_hash:
         return
@@ -454,30 +514,70 @@ def _build_volume_mounts(
     return mounts
 
 
+_RESERVED_SANDBOX_LABELS = frozenset(
+    {
+        "app",
+        "sandbox-id",
+        "app.kubernetes.io/name",
+        "app.kubernetes.io/component",
+        "deerflow.sandbox.name",
+        "deerflow.sandbox.ephemeral",
+    }
+)
+
+
+def _sandbox_labels(
+    sandbox_id: str,
+    *,
+    name: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> dict[str, str]:
+    merged = {key: value for key, value in (labels or {}).items() if key not in _RESERVED_SANDBOX_LABELS}
+    merged.update(
+        {
+            "app": "deer-flow-sandbox",
+            "sandbox-id": sandbox_id,
+            "app.kubernetes.io/name": "deer-flow",
+            "app.kubernetes.io/component": "sandbox",
+        }
+    )
+    if name:
+        merged["deerflow.sandbox.name"] = name
+    if ephemeral:
+        merged["deerflow.sandbox.ephemeral"] = "true"
+    return merged
+
+
 def _build_pod(
     sandbox_id: str,
     thread_id: str,
     user_id: str = DEFAULT_USER_ID,
     extra_mounts: list[ExtraMount] | None = None,
+    name: str | None = None,
+    image: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
 ) -> k8s_client.V1Pod:
     """Construct a Pod manifest for a single sandbox."""
     return k8s_client.V1Pod(
         metadata=k8s_client.V1ObjectMeta(
             name=_pod_name(sandbox_id),
             namespace=K8S_NAMESPACE,
-            annotations=_mount_contract_annotations(extra_mounts),
-            labels={
-                "app": "deer-flow-sandbox",
-                "sandbox-id": sandbox_id,
-                "app.kubernetes.io/name": "deer-flow",
-                "app.kubernetes.io/component": "sandbox",
-            },
+            annotations=_mount_contract_annotations(
+                extra_mounts,
+                name=name,
+                image=image,
+                labels=labels,
+                ephemeral=ephemeral,
+            ),
+            labels=_sandbox_labels(sandbox_id, name=name, labels=labels, ephemeral=ephemeral),
         ),
         spec=k8s_client.V1PodSpec(
             containers=[
                 k8s_client.V1Container(
                     name="sandbox",
-                    image=SANDBOX_IMAGE,
+                    image=image or SANDBOX_IMAGE,
                     image_pull_policy="IfNotPresent",
                     ports=[
                         k8s_client.V1ContainerPort(
@@ -531,18 +631,19 @@ def _build_pod(
     )
 
 
-def _build_service(sandbox_id: str) -> k8s_client.V1Service:
+def _build_service(
+    sandbox_id: str,
+    *,
+    name: str | None = None,
+    labels: dict[str, str] | None = None,
+    ephemeral: bool = False,
+) -> k8s_client.V1Service:
     """Construct a NodePort Service manifest (port auto-allocated by K8s)."""
     return k8s_client.V1Service(
         metadata=k8s_client.V1ObjectMeta(
             name=_svc_name(sandbox_id),
             namespace=K8S_NAMESPACE,
-            labels={
-                "app": "deer-flow-sandbox",
-                "sandbox-id": sandbox_id,
-                "app.kubernetes.io/name": "deer-flow",
-                "app.kubernetes.io/component": "sandbox",
-            },
+            labels=_sandbox_labels(sandbox_id, name=name, labels=labels, ephemeral=ephemeral),
         ),
         spec=k8s_client.V1ServiceSpec(
             type="NodePort",
@@ -603,6 +704,10 @@ async def create_sandbox(req: CreateSandboxRequest):
     thread_id = req.thread_id
     user_id = req.user_id
     extra_mounts = req.extra_mounts
+    name = req.name
+    image = req.image
+    labels = req.labels
+    ephemeral = req.ephemeral
 
     logger.info(
         "Received request to create sandbox '%s' for thread '%s' user '%s'",
@@ -614,7 +719,14 @@ async def create_sandbox(req: CreateSandboxRequest):
     # ── Fast path: sandbox already exists ────────────────────────────
     existing_port = _get_node_port(sandbox_id)
     if existing_port:
-        _ensure_existing_mount_contract(sandbox_id, extra_mounts)
+        _ensure_existing_mount_contract(
+            sandbox_id,
+            extra_mounts,
+            name=name,
+            image=image,
+            labels=labels,
+            ephemeral=ephemeral,
+        )
         return SandboxResponse(
             sandbox_id=sandbox_id,
             sandbox_url=_sandbox_url(existing_port),
@@ -623,7 +735,19 @@ async def create_sandbox(req: CreateSandboxRequest):
 
     # ── Create Pod ───────────────────────────────────────────────────
     try:
-        core_v1.create_namespaced_pod(K8S_NAMESPACE, _build_pod(sandbox_id, thread_id, user_id=user_id, extra_mounts=extra_mounts))
+        core_v1.create_namespaced_pod(
+            K8S_NAMESPACE,
+            _build_pod(
+                sandbox_id,
+                thread_id,
+                user_id=user_id,
+                extra_mounts=extra_mounts,
+                name=name,
+                image=image,
+                labels=labels,
+                ephemeral=ephemeral,
+            ),
+        )
         logger.info(f"Created Pod {_pod_name(sandbox_id)}")
     except ApiException as exc:
         if exc.status != 409:  # 409 = AlreadyExists
@@ -633,7 +757,10 @@ async def create_sandbox(req: CreateSandboxRequest):
 
     # ── Create Service ───────────────────────────────────────────────
     try:
-        core_v1.create_namespaced_service(K8S_NAMESPACE, _build_service(sandbox_id))
+        core_v1.create_namespaced_service(
+            K8S_NAMESPACE,
+            _build_service(sandbox_id, name=name, labels=labels, ephemeral=ephemeral),
+        )
         logger.info(f"Created Service {_svc_name(sandbox_id)}")
     except ApiException as exc:
         if exc.status != 409:

@@ -126,6 +126,36 @@ def test_upload_files_object_mode_writes_uploads_to_artifact_store(tmp_path):
     assert not tmp_path.joinpath("uploads").exists()
 
 
+def test_upload_files_object_mode_converts_documents_to_artifact_store(tmp_path):
+    store = InMemoryArtifactStore(prefix="deerflow")
+    cfg = _object_storage_config()
+
+    async def fake_convert(file_path: Path) -> Path:
+        assert file_path.name == "report.pdf"
+        md_path = file_path.with_suffix(".md")
+        md_path.write_text("converted markdown", encoding="utf-8")
+        return md_path
+
+    with (
+        patch.object(uploads, "make_artifact_store", return_value=store),
+        patch.object(uploads, "ensure_uploads_dir", side_effect=AssertionError("object mode must not create thread upload dirs")),
+        patch.object(uploads, "_auto_convert_documents_enabled", return_value=True),
+        patch.object(uploads, "convert_file_to_markdown", AsyncMock(side_effect=fake_convert)),
+        patch.object(uploads, "get_effective_user_id", return_value="user-1"),
+    ):
+        file = UploadFile(filename="report.pdf", file=BytesIO(b"pdf-bytes"))
+        result = asyncio.run(call_unwrapped(uploads.upload_files, "thread-object", request=MagicMock(), files=[file], config=cfg))
+
+    assert result.success is True
+    file_info = result.files[0]
+    assert file_info.markdown_file == "report.md"
+    assert file_info.markdown_path == "/mnt/user-data/uploads/report.md"
+    assert file_info.markdown_virtual_path == "/mnt/user-data/uploads/report.md"
+    assert file_info.markdown_artifact_url == "/api/threads/thread-object/artifacts/mnt/user-data/uploads/report.md"
+    assert store.get_bytes("user-1", "thread-object", "/mnt/user-data/uploads/report.pdf") == b"pdf-bytes"
+    assert store.get_bytes("user-1", "thread-object", "/mnt/user-data/uploads/report.md") == b"converted markdown"
+
+
 def test_list_uploaded_files_object_mode_reads_from_artifact_store():
     store = InMemoryArtifactStore(prefix="deerflow")
     cfg = _object_storage_config()

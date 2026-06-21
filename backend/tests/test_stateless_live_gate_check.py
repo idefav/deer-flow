@@ -79,6 +79,147 @@ def test_remote_live_gate_requires_host_path_or_prefix():
     assert gate["command"] == ["uv", "--directory", "backend", "run", "pytest", "tests/test_aio_sandbox_remote_live.py", "-q"]
 
 
+def test_acp_sandbox_native_gate_rejects_gateway_acp_in_object_runtime(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {"bucket": "deerflow-runtime"},
+                },
+                "acp_agents": {
+                    "codex": {
+                        "command": "codex-acp",
+                        "description": "Codex CLI",
+                        "execution_mode": "gateway",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(["acp_sandbox_native"], project_root=tmp_path, env={})
+
+    assert report["ok"] is False
+    gate = report["gates"][0]
+    assert gate["name"] == "acp_sandbox_native"
+    assert gate["ready_to_invoke"] is False
+    assert gate["config_issues"] == [
+        "object runtime ACP agent 'codex' must set execution_mode='sandbox' for strict stateless signing"
+    ]
+
+
+def test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "sandbox": {
+                    "use": "deerflow.community.aio_sandbox:AioSandboxProvider",
+                    "ephemeral_profiles": {"codex": {"image": "registry.local/codex-acp:latest"}},
+                },
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {"bucket": "deerflow-runtime"},
+                },
+                "acp_agents": {
+                    "codex": {
+                        "command": "codex-acp",
+                        "description": "Codex CLI",
+                        "execution_mode": "sandbox",
+                        "sandbox_scope": "isolated",
+                        "sandbox_profile": "codex",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(
+        ["acp_sandbox_native"],
+        project_root=tmp_path,
+        env={"DEER_FLOW_RUN_ACP_SANDBOX_NATIVE": "1"},
+    )
+
+    assert report["ok"] is True
+    gate = report["gates"][0]
+    assert gate["ready_to_invoke"] is True
+    assert gate["config_issues"] == []
+    assert gate["missing_env"] == []
+    assert gate["checked_env"] == ["DEER_FLOW_RUN_ACP_SANDBOX_NATIVE"]
+    assert gate["command"] == [
+        "uv",
+        "--directory",
+        "backend",
+        "run",
+        "pytest",
+        "tests/test_acp_sandbox_native_live.py",
+        "-q",
+    ]
+
+
+def test_acp_sandbox_native_gate_rejects_non_aio_provider_without_agents(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {"bucket": "deerflow-runtime"},
+                },
+                "acp_agents": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(
+        ["acp_sandbox_native"],
+        project_root=tmp_path,
+        env={"DEER_FLOW_RUN_ACP_SANDBOX_NATIVE": "1"},
+    )
+
+    assert report["ok"] is False
+    gate = report["gates"][0]
+    assert gate["ready_to_invoke"] is False
+    assert gate["config_issues"] == [
+        "config.yaml sandbox.use must be AioSandboxProvider for ACP sandbox-native execution"
+    ]
+
+
+def test_acp_sandbox_native_gate_requires_live_opt_in(tmp_path):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {"bucket": "deerflow-runtime"},
+                },
+                "acp_agents": {
+                    "codex": {
+                        "command": "codex-acp",
+                        "description": "Codex CLI",
+                        "execution_mode": "sandbox",
+                        "sandbox_scope": "isolated",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = live_gate_check.build_gate_report(["acp_sandbox_native"], project_root=tmp_path, env={})
+
+    assert report["ok"] is False
+    gate = report["gates"][0]
+    assert gate["ready_to_invoke"] is False
+    assert gate["missing_env"] == ["DEER_FLOW_RUN_ACP_SANDBOX_NATIVE"]
+    assert gate["config_issues"] == []
+
+
 def test_remote_live_gate_accepts_host_path_prefix():
     report = live_gate_check.build_gate_report(
         ["remote_live"],

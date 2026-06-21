@@ -41,6 +41,7 @@ class GateSpec:
     requires_model_config: bool = False
     requires_mcp_stateless_config: bool = False
     requires_runtime_object_storage: bool = False
+    requires_acp_sandbox_native_config: bool = False
 
 
 GATE_SPECS: dict[str, GateSpec] = {
@@ -112,6 +113,18 @@ GATE_SPECS: dict[str, GateSpec] = {
             "Existing runtime PVC/.deer-flow files have been imported with scripts/import_runtime_artifacts_to_object_store.py",
         ),
     ),
+    "acp_sandbox_native": GateSpec(
+        name="acp_sandbox_native",
+        description="ACP subprocess stateless gate for sandbox-native isolated ACP agents",
+        command=["uv", "--directory", "backend", "run", "pytest", "tests/test_acp_sandbox_native_live.py", "-q"],
+        required_env={"DEER_FLOW_RUN_ACP_SANDBOX_NATIVE": "1"},
+        requires_acp_sandbox_native_config=True,
+        manual_prerequisites=(
+            "Object runtime mode is enabled when ACP agents are configured",
+            "ACP agents that run in object mode use execution_mode=sandbox and isolated ephemeral sandboxes",
+            "Object store and sandbox provisioner are reachable from the live-gate runner",
+        ),
+    ),
 }
 
 
@@ -152,6 +165,8 @@ def _gate_report(spec: GateSpec, env: Mapping[str, str], project_root: Path) -> 
         readiness_reports.append(_mcp_stateless_readiness(project_root, env))
     if spec.requires_runtime_object_storage:
         readiness_reports.append(_runtime_object_storage_readiness(project_root, env))
+    if spec.requires_acp_sandbox_native_config:
+        readiness_reports.append(_acp_sandbox_native_readiness(project_root, env))
 
     config_issues: list[str] = []
     mcp_compatibility: list[dict[str, object]] = []
@@ -277,6 +292,15 @@ def _runtime_object_storage_readiness(project_root: Path, env: Mapping[str, str]
     return _file_runtime_object_storage_readiness(project_root, env)
 
 
+def _acp_sandbox_native_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
+    source_mode = env.get("DEER_FLOW_CONFIG_SOURCE", "file").strip().lower() or "file"
+    if source_mode == "db":
+        return _db_acp_sandbox_native_readiness(env)
+    if source_mode != "file":
+        return ConfigReadiness(config_issues=[f"DEER_FLOW_CONFIG_SOURCE must be 'file' or 'db', got {source_mode!r}"])
+    return _file_acp_sandbox_native_readiness(project_root, env)
+
+
 def _file_llm_config_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
     explicit_config_path = _env_value(env, "DEER_FLOW_CONFIG_PATH")
     config_path = Path(explicit_config_path) if explicit_config_path else _project_config_path(project_root, env)
@@ -340,6 +364,25 @@ def _file_runtime_object_storage_readiness(project_root: Path, env: Mapping[str,
         return ConfigReadiness(config_issues=[f"{config_path} is invalid YAML: {exc}"])
     source_label = _file_config_source_label(config_path, env, explicit_config_path=explicit_config_path)
     return _runtime_object_payload_readiness(payload, source_label=source_label, env=env)
+
+
+def _file_acp_sandbox_native_readiness(project_root: Path, env: Mapping[str, str]) -> ConfigReadiness:
+    explicit_config_path = _env_value(env, "DEER_FLOW_CONFIG_PATH")
+    config_path = Path(explicit_config_path) if explicit_config_path else _project_config_path(project_root, env)
+    if isinstance(config_path, ConfigReadiness):
+        return config_path
+    if not config_path.is_file():
+        if explicit_config_path:
+            return ConfigReadiness(config_issues=[f"DEER_FLOW_CONFIG_PATH file not found: {config_path}"])
+        if _env_value(env, "DEER_FLOW_PROJECT_ROOT"):
+            return ConfigReadiness(config_issues=[f"DEER_FLOW_PROJECT_ROOT config.yaml not found: {config_path}"])
+        return ConfigReadiness(config_issues=["config.yaml not found"])
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        return ConfigReadiness(config_issues=[f"{config_path} is invalid YAML: {exc}"])
+    source_label = _file_config_source_label(config_path, env, explicit_config_path=explicit_config_path)
+    return _acp_sandbox_payload_readiness(payload, source_label=source_label)
 
 
 def _project_config_path(project_root: Path, env: Mapping[str, str]) -> Path | ConfigReadiness:
@@ -482,6 +525,39 @@ def _db_runtime_object_storage_readiness(env: Mapping[str, str]) -> ConfigReadin
     )
 
 
+def _db_acp_sandbox_native_readiness(env: Mapping[str, str]) -> ConfigReadiness:
+    database_url = env.get("DEER_FLOW_DATABASE_URL", "").strip()
+    if not database_url:
+        return ConfigReadiness(
+            config_issues=["DEER_FLOW_DATABASE_URL is required when DEER_FLOW_CONFIG_SOURCE=db"],
+            checked_env=["DEER_FLOW_DATABASE_URL"],
+        )
+    try:
+        engine = create_engine(_sync_sqlalchemy_url(database_url))
+        try:
+            with Session(engine) as session:
+                row = session.get(RuntimeConfigRow, "app")
+                if row is None:
+                    return ConfigReadiness(
+                        config_issues=["DB runtime config key 'app' not found"],
+                        checked_env=["DEER_FLOW_DATABASE_URL"],
+                    )
+                payload = row.payload_json
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        return ConfigReadiness(
+            config_issues=[f"DB runtime config could not be loaded: {exc}"],
+            checked_env=["DEER_FLOW_DATABASE_URL"],
+        )
+    readiness = _acp_sandbox_payload_readiness(payload, source_label="DB runtime config key 'app'")
+    return ConfigReadiness(
+        config_issues=readiness.config_issues,
+        missing_env=readiness.missing_env,
+        checked_env=sorted({"DEER_FLOW_DATABASE_URL", *readiness.checked_env}),
+    )
+
+
 def _sync_sqlalchemy_url(url: str) -> str:
     from deerflow.config.bootstrap import database_config_from_url
 
@@ -548,6 +624,51 @@ def _runtime_object_payload_readiness(payload: object, *, source_label: str, env
         config_issues.append("provisioner USERDATA_PVC_NAME must be unset when runtime storage is object")
 
     return ConfigReadiness(config_issues=config_issues, checked_env=checked_env)
+
+
+def _acp_sandbox_payload_readiness(payload: object, *, source_label: str) -> ConfigReadiness:
+    if not isinstance(payload, dict):
+        return ConfigReadiness(config_issues=[f"{source_label} top-level value is not an object"])
+
+    runtime_storage = payload.get("runtime_storage")
+    if not isinstance(runtime_storage, dict):
+        runtime_storage = {}
+    backend = str(runtime_storage.get("backend") or "filesystem").strip().lower()
+    if backend != "object":
+        return ConfigReadiness(
+            config_issues=[f"{source_label} runtime_storage.backend must be 'object' for ACP sandbox-native stateless signing"]
+        )
+
+    sandbox_config = payload.get("sandbox")
+    sandbox_use = ""
+    if isinstance(sandbox_config, dict):
+        sandbox_use = str(sandbox_config.get("use") or "")
+
+    acp_agents = payload.get("acp_agents") or {}
+    if not isinstance(acp_agents, dict):
+        return ConfigReadiness(config_issues=[f"{source_label} acp_agents must be an object"])
+
+    config_issues: list[str] = []
+    if "AioSandboxProvider" not in sandbox_use:
+        config_issues.append(f"{source_label} sandbox.use must be AioSandboxProvider for ACP sandbox-native execution")
+
+    for name, agent_config in sorted(acp_agents.items()):
+        if not isinstance(agent_config, dict):
+            config_issues.append(f"ACP agent '{name}' config must be an object")
+            continue
+        execution_mode = str(agent_config.get("execution_mode") or "gateway").strip().lower()
+        if execution_mode != "sandbox":
+            config_issues.append(
+                f"object runtime ACP agent '{name}' must set execution_mode='sandbox' for strict stateless signing"
+            )
+            continue
+        sandbox_scope = str(agent_config.get("sandbox_scope") or "isolated").strip().lower()
+        if sandbox_scope != "isolated":
+            config_issues.append(
+                f"object runtime ACP agent '{name}' must set sandbox_scope='isolated' for strict stateless signing"
+            )
+
+    return ConfigReadiness(config_issues=config_issues)
 
 
 _STATELESS_MCP_STDIO_RUNTIME_MODES = {"sticky", "sidecar", "single-node"}

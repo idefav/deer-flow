@@ -22,6 +22,23 @@ class VolumeMountConfig(BaseModel):
     read_only: bool = Field(default=False, description="Whether the mount is read-only")
 
 
+class EphemeralSandboxProfileConfig(BaseModel):
+    """Configuration for named short-lived sandboxes such as ACP agents."""
+
+    image: str | None = Field(
+        default=None,
+        description="Optional image override for this ephemeral sandbox profile. Defaults to the main sandbox image.",
+    )
+    setup_commands: list[str] = Field(
+        default_factory=list,
+        description="Commands to run inside the ephemeral sandbox after it becomes ready.",
+    )
+    environment: dict[str, str] = Field(
+        default_factory=dict,
+        description="Environment variables available to setup commands and sandbox-launched subprocesses. Values starting with $ are resolved from host environment variables.",
+    )
+
+
 class SandboxConfig(BaseModel):
     """Config section for a sandbox.
 
@@ -79,6 +96,10 @@ class SandboxConfig(BaseModel):
     environment: dict[str, str] = Field(
         default_factory=dict,
         description="Environment variables to inject into the sandbox container. Values starting with $ will be resolved from host environment variables.",
+    )
+    ephemeral_profiles: dict[str, EphemeralSandboxProfileConfig] = Field(
+        default_factory=dict,
+        description="Named ephemeral sandbox profiles used by ACP and other short-lived sandbox-native subprocesses.",
     )
 
     bash_output_max_chars: int = Field(

@@ -44,6 +44,7 @@ markers = [
     "docker_live: live tests that require a local Docker daemon",
     "remote_live: live tests that require a remote service or cluster",
     "requires_llm: live tests that require configured model credentials",
+    "acp_sandbox_native: live tests for isolated ACP sandbox artifact visibility",
 ]
 
 [tool.uv]

@@ -1,8 +1,11 @@
 """Upload router for handling file uploads."""
 
 import logging
+import mimetypes
 import os
 import stat
+import tempfile
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
@@ -253,6 +256,7 @@ async def _upload_files_to_artifact_store(
     total_size = 0
     stored_virtual_paths: list[str] = []
     user_id = get_effective_user_id()
+    auto_convert_documents = _auto_convert_documents_enabled(config)
 
     for file in files:
         if not file.filename:
@@ -293,6 +297,26 @@ async def _upload_files_to_artifact_store(
             }
             if safe_filename != original_filename:
                 file_info["original_filename"] = original_filename
+
+            if auto_convert_documents and os.path.splitext(safe_filename)[1].lower() in CONVERTIBLE_EXTENSIONS:
+                md_result = await _convert_object_upload_to_markdown(data, safe_filename)
+                if md_result is not None:
+                    md_filename, md_data = md_result
+                    md_virtual_path = upload_virtual_path(md_filename)
+                    md_content_type, _ = mimetypes.guess_type(md_filename)
+                    artifact_store.put_bytes(
+                        user_id,
+                        thread_id,
+                        md_virtual_path,
+                        md_data,
+                        content_type=md_content_type,
+                        metadata={"filename": md_filename},
+                    )
+                    stored_virtual_paths.append(md_virtual_path)
+                    file_info["markdown_file"] = md_filename
+                    file_info["markdown_path"] = md_virtual_path
+                    file_info["markdown_virtual_path"] = md_virtual_path
+                    file_info["markdown_artifact_url"] = upload_artifact_url(thread_id, md_filename)
             uploaded_files.append(file_info)
         except HTTPException:
             for virtual_path in reversed(stored_virtual_paths):
@@ -308,6 +332,16 @@ async def _upload_files_to_artifact_store(
     if skipped_files:
         message += f"; skipped {len(skipped_files)} unsafe file(s)"
     return UploadResponse(success=not skipped_files, files=uploaded_files, message=message, skipped_files=skipped_files)
+
+
+async def _convert_object_upload_to_markdown(data: bytes, safe_filename: str) -> tuple[str, bytes] | None:
+    with tempfile.TemporaryDirectory(prefix="deerflow-upload-") as temp_dir:
+        source_path = Path(temp_dir) / safe_filename
+        source_path.write_bytes(data)
+        md_path = await convert_file_to_markdown(source_path)
+        if md_path is None:
+            return None
+        return md_path.name, md_path.read_bytes()
 
 
 def _list_uploaded_files_from_artifact_store(thread_id: str, *, artifact_store: ArtifactStore) -> UploadListResponse:

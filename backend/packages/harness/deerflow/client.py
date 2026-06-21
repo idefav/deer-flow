@@ -1271,21 +1271,65 @@ class DeerFlowClient:
         if artifact_store is not None:
             user_id = get_effective_user_id()
             uploaded_files: list[dict] = []
-            for src_path, dest_name in resolved_files:
-                virtual_path = upload_virtual_path(dest_name)
-                data = src_path.read_bytes()
-                content_type, _ = mimetypes.guess_type(dest_name)
-                artifact_store.put_bytes(user_id, thread_id, virtual_path, data, content_type=content_type)
-                info: dict[str, Any] = {
-                    "filename": dest_name,
-                    "size": len(data),
-                    "path": virtual_path,
-                    "virtual_path": virtual_path,
-                    "artifact_url": upload_artifact_url(thread_id, dest_name),
-                }
-                if dest_name != src_path.name:
-                    info["original_filename"] = src_path.name
-                uploaded_files.append(info)
+            conversion_pool = None
+            if has_convertible_file:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    conversion_pool = None
+                else:
+                    import concurrent.futures
+
+                    conversion_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+            def _convert_in_thread(path: Path):
+                return asyncio.run(convert_file_to_markdown(path))
+
+            try:
+                for src_path, dest_name in resolved_files:
+                    virtual_path = upload_virtual_path(dest_name)
+                    data = src_path.read_bytes()
+                    content_type, _ = mimetypes.guess_type(dest_name)
+                    artifact_store.put_bytes(user_id, thread_id, virtual_path, data, content_type=content_type)
+                    info: dict[str, Any] = {
+                        "filename": dest_name,
+                        "size": len(data),
+                        "path": virtual_path,
+                        "virtual_path": virtual_path,
+                        "artifact_url": upload_artifact_url(thread_id, dest_name),
+                    }
+                    if dest_name != src_path.name:
+                        info["original_filename"] = src_path.name
+
+                    if src_path.suffix.lower() in CONVERTIBLE_EXTENSIONS:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="deerflow-upload-") as temp_dir:
+                                temp_source = Path(temp_dir) / dest_name
+                                temp_source.write_bytes(data)
+                                if conversion_pool is not None:
+                                    md_path = conversion_pool.submit(_convert_in_thread, temp_source).result()
+                                else:
+                                    md_path = asyncio.run(convert_file_to_markdown(temp_source))
+                                if md_path is not None:
+                                    md_data = md_path.read_bytes()
+                                    md_virtual_path = upload_virtual_path(md_path.name)
+                                    md_content_type, _ = mimetypes.guess_type(md_path.name)
+                                    artifact_store.put_bytes(user_id, thread_id, md_virtual_path, md_data, content_type=md_content_type)
+                                    info["markdown_file"] = md_path.name
+                                    info["markdown_path"] = md_virtual_path
+                                    info["markdown_virtual_path"] = md_virtual_path
+                                    info["markdown_artifact_url"] = upload_artifact_url(thread_id, md_path.name)
+                        except Exception:
+                            logger.warning(
+                                "Failed to convert %s to markdown",
+                                src_path.name,
+                                exc_info=True,
+                            )
+
+                    uploaded_files.append(info)
+            finally:
+                if conversion_pool is not None:
+                    conversion_pool.shutdown(wait=True)
 
             return {
                 "success": True,

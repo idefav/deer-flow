@@ -276,6 +276,74 @@ class TestBuildPodVolumes:
         assert annotations[provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION] == provisioner_module._mount_contract_hash(extra_mounts)
         assert annotations[provisioner_module.MOUNT_CONTRACT_PATHS_ANNOTATION] == "/mnt/skills"
 
+    def test_pod_uses_create_options_image_and_labels(self, provisioner_module):
+        """Provisioner create options should affect the Pod manifest, not only the HTTP payload."""
+        pod = provisioner_module._build_pod(
+            "sandbox-1",
+            "thread-1",
+            name="acp-python",
+            image="example/acp-python:latest",
+            labels={"deerflow.sandbox.kind": "ephemeral", "team": "agents"},
+            ephemeral=True,
+        )
+
+        labels = pod.metadata.labels
+        assert pod.spec.containers[0].image == "example/acp-python:latest"
+        assert labels["deerflow.sandbox.kind"] == "ephemeral"
+        assert labels["deerflow.sandbox.name"] == "acp-python"
+        assert labels["deerflow.sandbox.ephemeral"] == "true"
+        assert labels["team"] == "agents"
+
+    def test_pod_reserved_labels_cannot_be_overridden(self, provisioner_module):
+        """User labels must not break pod/service identity or selectors."""
+        pod = provisioner_module._build_pod(
+            "sandbox-1",
+            "thread-1",
+            name="acp-python",
+            labels={
+                "app": "bad-app",
+                "sandbox-id": "bad-sandbox",
+                "app.kubernetes.io/name": "bad-name",
+                "app.kubernetes.io/component": "bad-component",
+                "deerflow.sandbox.name": "bad-name",
+                "deerflow.sandbox.ephemeral": "false",
+                "team": "agents",
+            },
+            ephemeral=True,
+        )
+        service = provisioner_module._build_service(
+            "sandbox-1",
+            name="acp-python",
+            labels={"sandbox-id": "bad-sandbox", "team": "agents"},
+            ephemeral=True,
+        )
+
+        labels = pod.metadata.labels
+        assert labels["app"] == "deer-flow-sandbox"
+        assert labels["sandbox-id"] == "sandbox-1"
+        assert labels["app.kubernetes.io/name"] == "deer-flow"
+        assert labels["app.kubernetes.io/component"] == "sandbox"
+        assert labels["deerflow.sandbox.name"] == "acp-python"
+        assert labels["deerflow.sandbox.ephemeral"] == "true"
+        assert labels["team"] == "agents"
+        assert service.metadata.labels["sandbox-id"] == "sandbox-1"
+        assert service.spec.selector == {"sandbox-id": "sandbox-1"}
+
+    def test_pod_records_create_options_in_contract_hash(self, provisioner_module):
+        """Existing Pod reuse must reject a different image/profile contract."""
+        default_pod = provisioner_module._build_pod("sandbox-1", "thread-1")
+        custom_pod = provisioner_module._build_pod(
+            "sandbox-1",
+            "thread-1",
+            name="acp-python",
+            image="example/acp-python:latest",
+            ephemeral=True,
+        )
+
+        default_hash = default_pod.metadata.annotations[provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION]
+        custom_hash = custom_pod.metadata.annotations[provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION]
+        assert default_hash != custom_hash
+
 
 # ── create_sandbox integration ─────────────────────────────────────────
 
@@ -299,15 +367,24 @@ async def test_create_sandbox_passes_extra_mounts_to_pod_builder(monkeypatch, pr
         node_port_calls["count"] += 1
         return None if node_port_calls["count"] == 1 else 31001
 
-    def fake_build_pod(sandbox_id, thread_id, user_id=provisioner_module.DEFAULT_USER_ID, extra_mounts=None):
-        captured["build_pod_args"] = (sandbox_id, thread_id, user_id, extra_mounts)
+    def fake_build_pod(
+        sandbox_id,
+        thread_id,
+        user_id=provisioner_module.DEFAULT_USER_ID,
+        extra_mounts=None,
+        name=None,
+        image=None,
+        labels=None,
+        ephemeral=False,
+    ):
+        captured["build_pod_args"] = (sandbox_id, thread_id, user_id, extra_mounts, name, image, labels, ephemeral)
         return "pod"
 
     monkeypatch.setattr(provisioner_module, "core_v1", FakeCoreV1())
     monkeypatch.setattr(provisioner_module, "_get_node_port", fake_get_node_port)
     monkeypatch.setattr(provisioner_module, "_get_pod_phase", lambda _sandbox_id: "Running")
     monkeypatch.setattr(provisioner_module, "_build_pod", fake_build_pod)
-    monkeypatch.setattr(provisioner_module, "_build_service", lambda _sandbox_id: "service")
+    monkeypatch.setattr(provisioner_module, "_build_service", lambda _sandbox_id, **_kwargs: "service")
 
     req = provisioner_module.CreateSandboxRequest(
         sandbox_id="sandbox-1",
@@ -324,11 +401,85 @@ async def test_create_sandbox_passes_extra_mounts_to_pod_builder(monkeypatch, pr
 
     response = await provisioner_module.create_sandbox(req)
 
-    sandbox_id, thread_id, user_id, extra_mounts = captured["build_pod_args"]
+    sandbox_id, thread_id, user_id, extra_mounts, name, image, labels, ephemeral = captured["build_pod_args"]
     assert (sandbox_id, thread_id, user_id) == ("sandbox-1", "thread-1", "user-7")
     assert extra_mounts == req.extra_mounts
+    assert (name, image, labels, ephemeral) == (None, None, {}, False)
     assert captured["pod"] == "pod"
     assert captured["service"] == "service"
+    assert response.sandbox_url.endswith(":31001")
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_passes_create_options_to_pod_builder(monkeypatch, provisioner_module):
+    """POST model should pass image/name/labels/ephemeral through to Pod construction."""
+    captured: dict[str, object] = {}
+    node_port_calls = {"count": 0}
+
+    class FakeCoreV1:
+        def create_namespaced_pod(self, namespace, pod):
+            captured["pod_namespace"] = namespace
+            captured["pod"] = pod
+
+        def create_namespaced_service(self, namespace, service):
+            captured["service_namespace"] = namespace
+            captured["service"] = service
+
+    def fake_get_node_port(_sandbox_id):
+        node_port_calls["count"] += 1
+        return None if node_port_calls["count"] == 1 else 31001
+
+    def fake_build_pod(
+        sandbox_id,
+        thread_id,
+        user_id=provisioner_module.DEFAULT_USER_ID,
+        extra_mounts=None,
+        name=None,
+        image=None,
+        labels=None,
+        ephemeral=False,
+    ):
+        captured["build_pod_args"] = (sandbox_id, thread_id, user_id, extra_mounts, name, image, labels, ephemeral)
+        return "pod"
+
+    def fake_build_service(sandbox_id, name=None, labels=None, ephemeral=False):
+        captured["build_service_args"] = (sandbox_id, name, labels, ephemeral)
+        return "service"
+
+    monkeypatch.setattr(provisioner_module, "core_v1", FakeCoreV1())
+    monkeypatch.setattr(provisioner_module, "_get_node_port", fake_get_node_port)
+    monkeypatch.setattr(provisioner_module, "_get_pod_phase", lambda _sandbox_id: "Running")
+    monkeypatch.setattr(provisioner_module, "_build_pod", fake_build_pod)
+    monkeypatch.setattr(provisioner_module, "_build_service", fake_build_service)
+
+    req = provisioner_module.CreateSandboxRequest(
+        sandbox_id="sandbox-1",
+        thread_id="thread-1",
+        user_id="user-7",
+        name="acp-python",
+        image="example/acp-python:latest",
+        labels={"deerflow.sandbox.kind": "ephemeral"},
+        ephemeral=True,
+    )
+
+    response = await provisioner_module.create_sandbox(req)
+
+    assert captured["build_pod_args"] == (
+        "sandbox-1",
+        "thread-1",
+        "user-7",
+        [],
+        "acp-python",
+        "example/acp-python:latest",
+        {"deerflow.sandbox.kind": "ephemeral"},
+        True,
+    )
+    assert captured["build_service_args"] == (
+        "sandbox-1",
+        "acp-python",
+        {"deerflow.sandbox.kind": "ephemeral"},
+        True,
+    )
     assert response.sandbox_url.endswith(":31001")
 
 

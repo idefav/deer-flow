@@ -127,6 +127,42 @@ def test_start_container_logs_redacted_env_values(monkeypatch, caplog):
     assert "visible-value" not in log_output
 
 
+def test_start_container_uses_create_options_image_and_labels(monkeypatch):
+    from deerflow.community.aio_sandbox.backend import SandboxCreateOptions
+
+    backend = LocalContainerBackend(
+        image="sandbox:latest",
+        base_port=8080,
+        container_prefix="sandbox",
+        config_mounts=[],
+        environment={},
+    )
+    monkeypatch.setattr(backend, "_runtime", "docker")
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        return SimpleNamespace(stdout="container-id\n", stderr="", returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    backend._start_container(
+        "sandbox-codex",
+        18080,
+        options=SandboxCreateOptions(
+            name="codex",
+            image="registry.local/codex-acp:latest",
+            labels={"deerflow.acp.agent": "codex"},
+            ephemeral=True,
+        ),
+    )
+
+    assert captured_cmd[-1] == "registry.local/codex-acp:latest"
+    assert "--label" in captured_cmd
+    assert "deerflow.acp.agent=codex" in captured_cmd
+    assert "deerflow.sandbox.name=codex" in captured_cmd
+    assert "deerflow.sandbox.ephemeral=true" in captured_cmd
+
+
 def _capture_start_container_command(monkeypatch, backend: LocalContainerBackend, runtime: str = "docker") -> list[str]:
     monkeypatch.setattr(backend, "_runtime", runtime)
     captured_cmd: list[str] = []

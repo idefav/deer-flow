@@ -8422,6 +8422,370 @@ git diff --check produced no output.
 
 ---
 
+## Batch 140: ACP Sandbox Native Preflight Provider Gate
+
+Date: 2026-06-21
+
+### Goal
+
+Close a false-ready gap in the `acp_sandbox_native` preflight: object-runtime signing must require an AIO sandbox provider even when `acp_agents` is empty, because the executable live gate itself acquires an active leader sandbox and an isolated ephemeral ACP sandbox.
+
+### Steps
+
+1. Add a failing test for object runtime with `LocalSandboxProvider`, empty `acp_agents`, and `DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1`.
+2. Require `sandbox.use` to include `AioSandboxProvider` whenever `acp_sandbox_native` checks object runtime config.
+3. Keep the existing configured-agent checks for `execution_mode=sandbox` and `sandbox_scope=isolated`.
+4. Update the operator runbook, requirement audit, and this implementation log.
+
+### Files Changed
+
+- `backend/scripts/check_stateless_live_gates.py`
+- `backend/tests/test_stateless_live_gate_check.py`
+- `docs/harness-stateless-db-mode-operator-runbook.md`
+- `docs/harness-stateless-db-mode-requirement-audit.md`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_rejects_non_aio_provider_without_agents -q
+```
+
+Result:
+
+```text
+1 failed, 1 warning in 0.25s
+Failure confirmed acp_sandbox_native incorrectly reported ok=True for object runtime with a non-AIO provider and no ACP agents.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_rejects_non_aio_provider_without_agents tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime -q
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py tests/test_acp_sandbox_native_live.py -q
+```
+
+Result:
+
+```text
+2 passed, 1 warning in 0.20s
+55 passed, 1 skipped, 1 warning in 0.46s
+```
+
+Full regression:
+
+```bash
+uv --directory backend run ruff check .
+git diff --check
+git diff --cached --check
+uv --directory backend run pytest -q
+```
+
+Result:
+
+```text
+All checks passed!
+git diff --check produced no output.
+git diff --cached --check produced no output.
+4969 passed, 37 skipped, 12 warnings in 94.28s
+```
+
+### Remaining Work
+
+- Execute the opt-in ACP sandbox-native gate in the target environment with `DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1`.
+- Execute and archive the production evidence bundle for `runtime_object_storage`, `acp_sandbox_native`, `remote_live`, and `requires_llm`, then validate it with `--require-run --require-logs`.
+
+---
+
+## Batch 139: ACP Sandbox Stateless Close-Out
+
+Date: 2026-06-21
+
+### Goal
+
+Close the remaining strict-stateless gaps for ACP sandbox-native mode: ACP artifacts flushed by an isolated ephemeral sandbox must be visible to the active leader sandbox, object-backed ACP calls must fail closed without `thread_id`, the `acp_sandbox_native` live gate must execute a real opt-in artifact-visibility test, and provisioner create-option labels must not override reserved Pod/Service identity labels.
+
+### Steps
+
+1. Add failing tests for active leader ACP refresh, object-mode sandbox ACP without `thread_id`, ACP sandbox-native live-gate command/opt-in, and provisioner reserved-label protection.
+2. Add `AioSandboxProvider.refresh_thread_artifacts(thread_id, roots=...)` and use it after sandbox-native ACP flush with `roots=(/mnt/acp-workspace,)`.
+3. Fail closed before acquiring an ephemeral ACP sandbox when `runtime_storage.backend=object` and no `thread_id` is available.
+4. Replace the self-recursive `acp_sandbox_native` gate command with `tests/test_acp_sandbox_native_live.py` and require `DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1`.
+5. Filter reserved provisioner labels before writing system labels.
+6. Update technical design, operator runbook, and requirement audit.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/tools/builtins/invoke_acp_agent_tool.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py`
+- `backend/scripts/check_stateless_live_gates.py`
+- `backend/tests/test_invoke_acp_agent_tool.py`
+- `backend/tests/test_aio_sandbox_provider.py`
+- `backend/tests/test_provisioner_pvc_volumes.py`
+- `backend/tests/test_stateless_live_gate_check.py`
+- `backend/tests/test_acp_sandbox_native_live.py`
+- `backend/pyproject.toml`
+- `docker/provisioner/app.py`
+- `docs/harness-stateless-db-mode-technical-design.md`
+- `docs/harness-stateless-db-mode-operator-runbook.md`
+- `docs/harness-stateless-db-mode-requirement-audit.md`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_materializes_and_flushes_acp_workspace tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_object_mode_requires_thread_id tests/test_aio_sandbox_provider.py::test_refresh_thread_artifacts_materializes_active_sandbox_acp_root_only tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_reserved_labels_cannot_be_overridden tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_requires_live_opt_in -q
+```
+
+Result:
+
+```text
+6 failed, 1 warning in 0.65s
+Failures confirmed missing leader refresh, missing object-mode no-thread-id guard, missing provider refresh API, reserved-label override risk, and static acp_sandbox_native gate behavior.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_materializes_and_flushes_acp_workspace tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_object_mode_requires_thread_id tests/test_aio_sandbox_provider.py::test_refresh_thread_artifacts_materializes_active_sandbox_acp_root_only tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_reserved_labels_cannot_be_overridden tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_requires_live_opt_in -q
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py tests/test_runtime_artifact_materializer.py tests/test_aio_sandbox_provider.py tests/test_provisioner_pvc_volumes.py tests/test_stateless_live_gate_check.py -q
+uv --directory backend run pytest tests/test_acp_sandbox_native_live.py -q
+```
+
+Result:
+
+```text
+6 passed, 1 warning in 0.51s
+159 passed, 1 warning in 1.37s
+1 skipped, 1 warning in 0.19s
+```
+
+Full regression:
+
+```bash
+uv --directory backend run ruff check .
+git diff --check
+uv --directory backend run pytest -q
+```
+
+Result:
+
+```text
+All checks passed!
+git diff --check produced no output.
+4968 passed, 37 skipped, 12 warnings in 93.71s
+```
+
+### Remaining Work
+
+- Execute the opt-in ACP sandbox-native gate in the target environment with `DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1`.
+- Execute and archive the production evidence bundle for `runtime_object_storage`, `acp_sandbox_native`, `remote_live`, and `requires_llm`, then validate it with `--require-run --require-logs`.
+
+---
+
+## Batch 136: ACP Sandbox-Native Stateless Execution Foundation
+
+Date: 2026-06-21
+
+### Goal
+
+Close the ACP runtime-local subprocess gap for strict stateless mode. Gateway ACP execution remains available for file-mode compatibility, but object-runtime signing now has a sandbox-native path where ACP subprocesses run in named isolated ephemeral AIO sandboxes.
+
+### Steps
+
+1. Add failing tests for ACP execution-mode config, sandbox ephemeral profiles, backend create options, provider `acquire_ephemeral()`, and remote provisioner option forwarding.
+2. Add `SandboxCreateOptions` and propagate `name`, `image`, `labels`, and `ephemeral` through local and remote AIO backends.
+3. Add `sandbox.ephemeral_profiles` and `ACPAgentConfig.execution_mode/sandbox_scope/sandbox_profile`.
+4. Implement `AioSandboxProvider.acquire_ephemeral(name, profile)` with profile image/setup commands, no thread cache, no warm-pool reuse, and destroy-on-release behavior.
+5. Route `invoke_acp_agent` through sandbox-native ACP execution when `execution_mode=sandbox`; bridge ACP stdio over the AIO bash session API.
+6. Add the `acp_sandbox_native` live-gate preflight over file/DB app config.
+7. Update technical design, operator runbook, requirement audit, and this implementation log.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/config/acp_config.py`
+- `backend/packages/harness/deerflow/config/sandbox_config.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/backend.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/local_backend.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/remote_backend.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py`
+- `backend/packages/harness/deerflow/tools/builtins/invoke_acp_agent_tool.py`
+- `backend/scripts/check_stateless_live_gates.py`
+- focused tests and stateless docs
+
+### Verification
+
+Red checks:
+
+```bash
+uv --directory backend run pytest tests/test_acp_config.py::test_acp_agent_config_defaults_to_gateway_execution_mode tests/test_acp_config.py::test_acp_agent_config_accepts_sandbox_execution_mode tests/test_aio_sandbox_provider.py::test_sandbox_config_accepts_ephemeral_profiles tests/test_aio_sandbox_provider.py::test_acquire_ephemeral_uses_named_profile_without_thread_cache tests/test_aio_sandbox_local_backend.py::test_start_container_uses_create_options_image_and_labels tests/test_remote_sandbox_backend.py::test_provisioner_create_forwards_create_options -q
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_uses_ephemeral_sandbox -q
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_rejects_gateway_acp_in_object_runtime tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime -q
+```
+
+Result:
+
+```text
+The first red check failed with missing ACP config fields, missing ephemeral profile model, missing acquire_ephemeral(), and missing SandboxCreateOptions.
+The sandbox-mode ACP invocation red check failed because the tool still imported gateway spawn_agent_process.
+The live-gate red check failed because acp_sandbox_native was not registered.
+```
+
+Focused green checks:
+
+```bash
+uv --directory backend run pytest tests/test_acp_config.py::test_acp_agent_config_defaults_to_gateway_execution_mode tests/test_acp_config.py::test_acp_agent_config_accepts_sandbox_execution_mode tests/test_aio_sandbox_provider.py::test_sandbox_config_accepts_ephemeral_profiles tests/test_aio_sandbox_provider.py::test_acquire_ephemeral_uses_named_profile_without_thread_cache tests/test_aio_sandbox_local_backend.py::test_start_container_uses_create_options_image_and_labels tests/test_remote_sandbox_backend.py::test_provisioner_create_forwards_create_options -q
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_uses_ephemeral_sandbox -q
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_rejects_gateway_acp_in_object_runtime tests/test_stateless_live_gate_check.py::test_acp_sandbox_native_gate_accepts_isolated_sandbox_acp_in_object_runtime -q
+```
+
+Result:
+
+```text
+6 passed, 1 warning
+1 passed, 1 warning
+2 passed, 1 warning
+```
+
+### Remaining Work
+
+- Run the broader focused suites and full regression after this batch.
+- Execute `runtime_object_storage`, `acp_sandbox_native`, `remote_live`, and `requires_llm` gates in the target environment and archive validated evidence.
+
+---
+
+## Batch 137: Provisioner ACP Sandbox Create Options
+
+Date: 2026-06-21
+
+### Goal
+
+Close the final provisioner hop for ACP sandbox-native execution. Remote backend create payloads already carry `name`, `image`, `labels`, and `ephemeral`; the bundled Kubernetes provisioner now consumes those fields when building Pods and Services, so named ACP profiles can select images without relying on gateway-local execution.
+
+### Steps
+
+1. Add failing provisioner tests proving create options affect the Pod manifest and are passed from the POST request model to the Pod/Service builders.
+2. Add `name`, `image`, `labels`, and `ephemeral` to `CreateSandboxRequest`.
+3. Apply image override to the sandbox container image.
+4. Merge create labels into Pod/Service labels and add enforced `deerflow.sandbox.name` / `deerflow.sandbox.ephemeral` labels.
+5. Include create options in the existing contract hash so an existing sandbox id cannot be silently reused with a different image/profile contract.
+
+### Files Changed
+
+- `docker/provisioner/app.py`
+- `backend/tests/test_provisioner_pvc_volumes.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_uses_create_options_image_and_labels tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_records_create_options_in_contract_hash tests/test_provisioner_pvc_volumes.py::test_create_sandbox_passes_create_options_to_pod_builder -q
+```
+
+Result:
+
+```text
+3 failed, 1 warning
+Failures confirmed _build_pod rejected name/image options and CreateSandboxRequest did not pass them through.
+```
+
+Focused green checks:
+
+```bash
+uv --directory backend run pytest tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_uses_create_options_image_and_labels tests/test_provisioner_pvc_volumes.py::TestBuildPodVolumes::test_pod_records_create_options_in_contract_hash tests/test_provisioner_pvc_volumes.py::test_create_sandbox_passes_create_options_to_pod_builder -q
+uv --directory backend run pytest tests/test_provisioner_pvc_volumes.py -q
+uv --directory backend run pytest tests/test_acp_config.py tests/test_aio_sandbox_provider.py tests/test_aio_sandbox_local_backend.py tests/test_remote_sandbox_backend.py tests/test_invoke_acp_agent_tool.py tests/test_stateless_live_gate_check.py tests/test_provisioner_pvc_volumes.py -q
+uv --directory backend run ruff check .
+uv --directory backend run pytest -q
+```
+
+Result:
+
+```text
+3 passed, 1 warning
+34 passed, 1 warning
+212 passed, 1 warning
+All checks passed!
+4962 passed, 36 skipped, 12 warnings in 93.13s
+```
+
+### Remaining Work
+
+- Execute and archive the target-environment live gates, including `acp_sandbox_native`.
+
+---
+
+## Batch 138: ACP Sandbox Object Workspace Root Sync
+
+Date: 2026-06-21
+
+### Goal
+
+Close the sandbox-native ACP persistence gap. Independent ACP sandboxes now materialize `/mnt/acp-workspace` from object storage before invocation and flush only that root back before release, so ACP outputs can be read by the leader sandbox later without deleting leader-owned `/mnt/user-data` artifacts.
+
+### Steps
+
+1. Add failing tests for root-scoped materializer flush and ACP sandbox-native object workspace materialize/flush.
+2. Extend `SandboxArtifactMaterializer.materialize_thread()` and `flush_thread()` with a `roots` parameter.
+3. In `invoke_acp_agent`, when `execution_mode=sandbox` and object runtime has a `thread_id`, materialize only `ACP_WORKSPACE_ROOT` into the ephemeral sandbox.
+4. Flush only `ACP_WORKSPACE_ROOT` after the ACP process completes and before releasing the ephemeral sandbox.
+5. Preserve `/mnt/user-data` object-store paths untouched by ACP sandbox flush.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/artifacts/sandbox_materializer.py`
+- `backend/packages/harness/deerflow/tools/builtins/invoke_acp_agent_tool.py`
+- `backend/tests/test_runtime_artifact_materializer.py`
+- `backend/tests/test_invoke_acp_agent_tool.py`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+
+### Verification
+
+Red check:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py::test_flush_thread_can_scope_roots_without_deleting_unselected_paths tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_materializes_and_flushes_acp_workspace -q
+```
+
+Result:
+
+```text
+2 failed, 1 warning
+Failures confirmed root-scoped flush was unsupported and ACP sandbox mode did not materialize object-store ACP workspace files.
+```
+
+Green checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py::test_flush_thread_can_scope_roots_without_deleting_unselected_paths tests/test_invoke_acp_agent_tool.py::test_invoke_acp_agent_sandbox_mode_materializes_and_flushes_acp_workspace -q
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py tests/test_invoke_acp_agent_tool.py tests/test_aio_sandbox_provider.py tests/test_stateless_live_gate_check.py -q
+uv --directory backend run ruff check .
+uv --directory backend run pytest -q
+git diff --check
+```
+
+Result:
+
+```text
+2 passed, 1 warning
+121 passed, 1 warning
+All checks passed!
+4964 passed, 36 skipped, 12 warnings in 92.26s
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Execute and archive the target-environment live gates, including `runtime_object_storage`, `acp_sandbox_native`, `remote_live`, and `requires_llm`.
+
+---
+
 ## Batch 134: Runtime Object Storage Close-Out Audit
 
 Date: 2026-06-21
@@ -9062,6 +9426,95 @@ git diff --check produced no output.
 - Update tools that read local output paths (`present_file`, `view_image`, upload prompt middleware) to use object mode where applicable.
 - Add provisioner strict object mode that removes runtime PVC mounts and blocks `USERDATA_PVC_NAME`.
 - Add migration tooling and live evidence for object-backed runtime files.
+
+---
+
+## Batch 134: Runtime Object Storage Local-State Close-Out Fixes
+
+Date: 2026-06-21
+
+### Goal
+
+Close the remaining runtime-PVC removal gaps so object mode treats object storage as the only durable source of truth for `/mnt/user-data/{workspace,uploads,outputs}` and `/mnt/acp-workspace`.
+
+### Steps
+
+1. Add object-store/sandbox reconcile coverage for deleted runtime files and enforce materialize file/byte budgets.
+2. Flush object runtime artifacts before release, destroy, shutdown, unhealthy-drop, idle warm-pool destroy, warm-pool eviction, and shutdown warm-pool destroy paths.
+3. Return `uses_thread_data_mounts=False` for local-container object mode so large tool outputs are written into sandbox paths and flushed to object storage.
+4. Stage ACP workspace in a temporary directory for object mode, materialize from `/mnt/acp-workspace` before ACP invocation, and reconcile created/modified/deleted ACP files back to object storage after invocation.
+5. Add object-mode upload conversion parity for gateway uploads and the embedded client.
+6. Preserve filesystem mode and orphan-container warm-pool compatibility.
+
+### Files Changed
+
+- `backend/packages/harness/deerflow/artifacts/sandbox_materializer.py`
+- `backend/packages/harness/deerflow/community/aio_sandbox/aio_sandbox_provider.py`
+- `backend/packages/harness/deerflow/tools/builtins/invoke_acp_agent_tool.py`
+- `backend/app/gateway/routers/uploads.py`
+- `backend/packages/harness/deerflow/client.py`
+- `backend/tests/test_runtime_artifact_materializer.py`
+- `backend/tests/test_aio_sandbox_provider.py`
+- `backend/tests/test_invoke_acp_agent_tool.py`
+- `backend/tests/test_uploads_router.py`
+- `backend/tests/test_client.py`
+
+### Verification
+
+Red checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py -q
+uv --directory backend run pytest tests/test_aio_sandbox_provider.py::test_destroy_flushes_object_runtime_before_closing_sandbox tests/test_aio_sandbox_provider.py::test_shutdown_flushes_object_runtime_before_destroying_active_sandboxes tests/test_aio_sandbox_provider.py::test_drop_unhealthy_sandbox_flushes_object_runtime_before_close tests/test_aio_sandbox_provider.py::test_uses_thread_data_mounts_is_false_for_local_backend_object_runtime tests/test_aio_sandbox_provider.py::test_materialize_thread_artifacts_passes_object_store_budget_config -q
+uv --directory backend run pytest tests/test_invoke_acp_agent_tool.py::test_acp_workspace_context_object_runtime_materializes_and_flushes_artifact_store -q
+uv --directory backend run pytest tests/test_uploads_router.py::test_upload_files_object_mode_converts_documents_to_artifact_store tests/test_client.py::TestUploads::test_object_runtime_upload_converts_documents_to_artifact_store -q
+```
+
+Result:
+
+```text
+3 failed, 2 passed, 1 warning in 0.29s
+5 failed, 1 warning in 0.32s
+1 failed, 1 warning in 0.35s
+2 failed, 2 warnings in 0.78s
+Failures confirmed the missing deletion sync, budget wiring, lifecycle flush coverage, object-mode mount routing, ACP object staging, and upload conversion parity.
+```
+
+Focused checks:
+
+```bash
+uv --directory backend run pytest tests/test_runtime_artifact_materializer.py tests/test_aio_sandbox_provider.py tests/test_tool_output_budget_middleware.py tests/test_invoke_acp_agent_tool.py -q
+uv --directory backend run pytest tests/test_uploads_router.py tests/test_client.py tests/test_stateless_live_gate_check.py -q
+uv --directory backend run pytest tests/test_sandbox_orphan_reconciliation.py::test_reconcile_adopts_young_containers tests/test_aio_sandbox_provider.py -q
+```
+
+Result:
+
+```text
+158 passed, 1 warning in 0.76s
+237 passed, 2 warnings in 1.24s
+41 passed, 1 warning in 0.43s
+```
+
+Full regression:
+
+```bash
+uv --directory backend run pytest -q
+uv --directory backend run ruff check .
+git diff --check
+```
+
+Result:
+
+```text
+4950 passed, 36 skipped, 12 warnings in 91.28s
+All checks passed!
+git diff --check produced no output.
+```
+
+### Remaining Work
+
+- Execute and archive `runtime_object_storage`, `remote_live`, and `requires_llm` live evidence in the target environment before production sign-off.
 
 ---
 

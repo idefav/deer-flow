@@ -15,6 +15,7 @@ import atexit
 import hashlib
 import logging
 import os
+import shlex
 import signal
 import threading
 import time
@@ -39,7 +40,7 @@ from deerflow.sandbox.sandbox_provider import SandboxProvider
 from deerflow.skills.storage import get_or_new_skill_storage
 
 from .aio_sandbox import AioSandbox
-from .backend import SandboxBackend, wait_for_sandbox_ready, wait_for_sandbox_ready_async
+from .backend import SandboxBackend, SandboxCreateOptions, wait_for_sandbox_ready, wait_for_sandbox_ready_async
 from .local_backend import LocalContainerBackend
 from .remote_backend import RemoteSandboxBackend
 from .sandbox_info import SandboxInfo
@@ -56,6 +57,8 @@ IDLE_CHECK_INTERVAL = 60  # Check every 60 seconds
 THREAD_LOCK_EXECUTOR_WORKERS = min(32, (os.cpu_count() or 1) + 4)
 _THREAD_LOCK_EXECUTOR = ThreadPoolExecutor(max_workers=THREAD_LOCK_EXECUTOR_WORKERS, thread_name_prefix="sandbox-lock-wait")
 atexit.register(_THREAD_LOCK_EXECUTOR.shutdown, wait=False, cancel_futures=True)
+
+WarmPoolEntry = tuple[SandboxInfo, float] | tuple[SandboxInfo, float, tuple[str, ...]]
 
 
 def _lock_file_exclusive(lock_file) -> None:
@@ -117,6 +120,14 @@ def _object_runtime_storage_enabled() -> bool:
         return False
 
 
+def _unpack_warm_pool_entry(entry: WarmPoolEntry) -> tuple[SandboxInfo, float, tuple[str, ...]]:
+    if len(entry) == 2:
+        info, release_ts = entry
+        return info, release_ts, ()
+    info, release_ts, thread_ids = entry
+    return info, release_ts, thread_ids
+
+
 class AioSandboxProvider(SandboxProvider):
     """Sandbox provider that manages containers running the AIO sandbox.
 
@@ -146,13 +157,14 @@ class AioSandboxProvider(SandboxProvider):
         self._sandboxes: dict[str, AioSandbox] = {}  # sandbox_id -> AioSandbox instance
         self._sandbox_infos: dict[str, SandboxInfo] = {}  # sandbox_id -> SandboxInfo (for destroy)
         self._thread_sandboxes: dict[str, str] = {}  # thread_id -> sandbox_id
+        self._ephemeral_sandboxes: set[str] = set()  # sandbox IDs that must be destroyed on release
         self._thread_locks: dict[str, threading.Lock] = {}  # thread_id -> in-process lock
         self._last_activity: dict[str, float] = {}  # sandbox_id -> last activity timestamp
         # Warm pool: released sandboxes whose containers are still running.
-        # Maps sandbox_id -> (SandboxInfo, release_timestamp).
+        # Maps sandbox_id -> (SandboxInfo, release_timestamp, flushed_thread_ids).
         # Containers here can be reclaimed quickly (no cold-start) or destroyed
         # when replicas capacity is exhausted.
-        self._warm_pool: dict[str, tuple[SandboxInfo, float]] = {}
+        self._warm_pool: dict[str, WarmPoolEntry] = {}
         self._shutdown_called = False
         self._idle_checker_stop = threading.Event()
         self._idle_checker_thread: threading.Thread | None = None
@@ -179,7 +191,7 @@ class AioSandboxProvider(SandboxProvider):
         written by the gateway are already visible when the sandbox starts.
         Remote backends may require explicit file sync.
         """
-        return isinstance(self._backend, LocalContainerBackend)
+        return isinstance(self._backend, LocalContainerBackend) and not _object_runtime_storage_enabled()
 
     # ── Factory methods ──────────────────────────────────────────────────
 
@@ -224,6 +236,7 @@ class AioSandboxProvider(SandboxProvider):
             "replicas": replicas if replicas is not None else DEFAULT_REPLICAS,
             "mounts": sandbox_config.mounts or [],
             "environment": self._resolve_env_vars(sandbox_config.environment or {}),
+            "ephemeral_profiles": sandbox_config.ephemeral_profiles or {},
             # provisioner URL for dynamic pod management (e.g. http://provisioner:8002)
             "provisioner_url": getattr(sandbox_config, "provisioner_url", None) or "",
         }
@@ -406,7 +419,7 @@ class AioSandboxProvider(SandboxProvider):
     def _cleanup_idle_sandboxes(self, idle_timeout: float) -> None:
         current_time = time.time()
         active_to_destroy = []
-        warm_to_destroy: list[tuple[str, SandboxInfo]] = []
+        warm_to_destroy: list[tuple[str, SandboxInfo, tuple[str, ...]]] = []
 
         with self._lock:
             # Active sandboxes: tracked via _last_activity
@@ -417,10 +430,11 @@ class AioSandboxProvider(SandboxProvider):
                     logger.info(f"Sandbox {sandbox_id} idle for {idle_duration:.1f}s, marking for destroy")
 
             # Warm pool: tracked via release_timestamp stored in _warm_pool
-            for sandbox_id, (info, release_ts) in list(self._warm_pool.items()):
+            for sandbox_id, entry in list(self._warm_pool.items()):
+                info, release_ts, thread_ids = _unpack_warm_pool_entry(entry)
                 warm_duration = current_time - release_ts
                 if warm_duration > idle_timeout:
-                    warm_to_destroy.append((sandbox_id, info))
+                    warm_to_destroy.append((sandbox_id, info, thread_ids))
                     del self._warm_pool[sandbox_id]
                     logger.info(f"Warm-pool sandbox {sandbox_id} idle for {warm_duration:.1f}s, marking for destroy")
 
@@ -446,8 +460,9 @@ class AioSandboxProvider(SandboxProvider):
                 logger.error(f"Failed to destroy idle sandbox {sandbox_id}: {e}")
 
         # Destroy warm-pool sandboxes (already removed from _warm_pool under lock above)
-        for sandbox_id, info in warm_to_destroy:
+        for sandbox_id, info, thread_ids in warm_to_destroy:
             try:
+                self._flush_warm_pool_artifacts(sandbox_id, info, thread_ids, action="idle warm-pool destroy")
                 self._backend.destroy(info)
                 logger.info(f"Destroyed idle warm-pool sandbox {sandbox_id}")
             except Exception as e:
@@ -546,7 +561,7 @@ class AioSandboxProvider(SandboxProvider):
             if sandbox_id not in self._warm_pool:
                 return None
 
-            info, _ = self._warm_pool[sandbox_id]
+            info, _, _ = _unpack_warm_pool_entry(self._warm_pool[sandbox_id])
 
         alive = self._check_tracked_sandbox_alive(sandbox_id, info)
         if alive is False:
@@ -561,7 +576,7 @@ class AioSandboxProvider(SandboxProvider):
             warm_item = self._warm_pool.pop(sandbox_id, None)
             if warm_item is None:
                 return None
-            info, _ = warm_item
+            info, _, _ = _unpack_warm_pool_entry(warm_item)
             sandbox = AioSandbox(id=sandbox_id, base_url=info.sandbox_url)
             self._sandboxes[sandbox_id] = sandbox
             self._sandbox_infos[sandbox_id] = info
@@ -611,7 +626,13 @@ class AioSandboxProvider(SandboxProvider):
         config = get_app_config()
         return make_artifact_store(config.runtime_storage)
 
-    def _materialize_thread_artifacts(self, thread_id: str, sandbox_id: str) -> None:
+    def _materialize_thread_artifacts(
+        self,
+        thread_id: str,
+        sandbox_id: str,
+        *,
+        roots: tuple[str, ...] | None = None,
+    ) -> None:
         artifact_store = self._get_runtime_artifact_store()
         if artifact_store is None:
             return
@@ -619,7 +640,28 @@ class AioSandboxProvider(SandboxProvider):
         if sandbox is None:
             return
         user_id = str(get_effective_user_id())
-        SandboxArtifactMaterializer(artifact_store).materialize_thread(user_id, thread_id, sandbox)
+        object_store_config = get_app_config().runtime_storage.object_store
+        materializer_kwargs = {}
+        if object_store_config is not None:
+            materializer_kwargs = {
+                "max_materialize_files": object_store_config.max_materialize_files,
+                "max_materialize_bytes": object_store_config.max_materialize_bytes,
+            }
+        materializer = SandboxArtifactMaterializer(artifact_store, **materializer_kwargs)
+        if roots is None:
+            materializer.materialize_thread(user_id, thread_id, sandbox)
+        else:
+            materializer.materialize_thread(user_id, thread_id, sandbox, roots=roots)
+
+    def refresh_thread_artifacts(self, thread_id: str, *, roots: tuple[str, ...] | None = None) -> bool:
+        """Materialize object runtime artifacts into an already-active thread sandbox."""
+        with self._lock:
+            sandbox_id = self._thread_sandboxes.get(thread_id)
+            if sandbox_id is None or sandbox_id not in self._sandboxes:
+                return False
+
+        self._materialize_thread_artifacts(thread_id, sandbox_id, roots=roots)
+        return True
 
     def _flush_thread_artifacts(self, thread_id: str, sandbox: Sandbox) -> None:
         artifact_store = self._get_runtime_artifact_store()
@@ -627,6 +669,32 @@ class AioSandboxProvider(SandboxProvider):
             return
         user_id = str(get_effective_user_id())
         SandboxArtifactMaterializer(artifact_store).flush_thread(user_id, thread_id, sandbox)
+
+    def _flush_thread_artifacts_for_threads(self, thread_ids: list[str] | tuple[str, ...], sandbox: Sandbox, *, action: str) -> None:
+        for thread_id in thread_ids:
+            try:
+                self._flush_thread_artifacts(thread_id, sandbox)
+            except Exception as e:
+                logger.warning(f"Failed to flush runtime artifacts for thread {thread_id} before {action}: {e}")
+
+    def _flush_warm_pool_artifacts(
+        self,
+        sandbox_id: str,
+        info: SandboxInfo,
+        thread_ids: tuple[str, ...],
+        *,
+        action: str,
+    ) -> None:
+        if not thread_ids:
+            return
+        sandbox = AioSandbox(id=sandbox_id, base_url=info.sandbox_url)
+        try:
+            self._flush_thread_artifacts_for_threads(thread_ids, sandbox, action=action)
+        finally:
+            try:
+                sandbox.close()
+            except Exception as e:
+                logger.warning(f"Error closing warm-pool sandbox client {sandbox_id} during {action}: {e}")
 
     def _check_tracked_sandbox_alive(self, sandbox_id: str, info: SandboxInfo) -> bool | None:
         """Return whether a tracked sandbox appears alive, or None if unknown."""
@@ -641,7 +709,7 @@ class AioSandboxProvider(SandboxProvider):
         sandbox_id: str,
         *,
         expected_info: SandboxInfo | None = None,
-    ) -> tuple[Sandbox | None, SandboxInfo | None, bool]:
+    ) -> tuple[Sandbox | None, SandboxInfo | None, list[str] | tuple[str, ...], bool]:
         """Remove a sandbox from in-process tracking maps.
 
         When expected_info is provided, removal only happens if the currently
@@ -654,9 +722,9 @@ class AioSandboxProvider(SandboxProvider):
         with self._lock:
             active_info = self._sandbox_infos.get(sandbox_id)
             warm_item = self._warm_pool.get(sandbox_id)
-            warm_info = warm_item[0] if warm_item is not None else None
+            warm_info = _unpack_warm_pool_entry(warm_item)[0] if warm_item is not None else None
             if expected_info is not None and active_info is not expected_info and warm_info is not expected_info:
-                return None, None, False
+                return None, None, [], False
 
             sandbox = self._sandboxes.pop(sandbox_id, None)
             info = self._sandbox_infos.pop(sandbox_id, None)
@@ -664,25 +732,29 @@ class AioSandboxProvider(SandboxProvider):
             for tid in thread_ids_to_remove:
                 del self._thread_sandboxes[tid]
             self._last_activity.pop(sandbox_id, None)
+            self._ephemeral_set().discard(sandbox_id)
             if info is None and sandbox_id in self._warm_pool:
-                info, _ = self._warm_pool.pop(sandbox_id)
+                info, _, thread_ids_to_remove = _unpack_warm_pool_entry(self._warm_pool.pop(sandbox_id))
             else:
                 self._warm_pool.pop(sandbox_id, None)
 
-        return sandbox, info, True
+        return sandbox, info, thread_ids_to_remove, True
 
     def _drop_unhealthy_sandbox(self, sandbox_id: str, reason: str, *, expected_info: SandboxInfo | None = None) -> None:
         """Remove and destroy a sandbox after a definitive failed health check."""
-        sandbox, info, removed = self._remove_tracked_sandbox(sandbox_id, expected_info=expected_info)
+        sandbox, info, thread_ids, removed = self._remove_tracked_sandbox(sandbox_id, expected_info=expected_info)
         if not removed:
             logger.info(f"Skipped dropping sandbox {sandbox_id}: tracked info changed after health check")
             return
 
         if sandbox is not None:
+            self._flush_thread_artifacts_for_threads(thread_ids, sandbox, action="unhealthy sandbox drop")
             try:
                 sandbox.close()
             except Exception as e:
                 logger.warning(f"Error closing unhealthy sandbox {sandbox_id}: {e}")
+        elif info is not None:
+            self._flush_warm_pool_artifacts(sandbox_id, info, tuple(thread_ids), action="unhealthy sandbox drop")
 
         if info is not None:
             try:
@@ -750,6 +822,108 @@ class AioSandboxProvider(SandboxProvider):
                 thread_lock.release()
 
         return await self._acquire_internal_async(thread_id)
+
+    def acquire_ephemeral(self, name: str, profile: str | None = None) -> str:
+        """Acquire a named short-lived sandbox that is destroyed on release.
+
+        Ephemeral sandboxes are intentionally not associated with a thread id:
+        they do not use deterministic IDs, do not populate ``_thread_sandboxes``,
+        and do not enter the warm pool.  This is the allocation path used by
+        sandbox-native ACP agents.
+        """
+        sandbox_name = self._sanitize_ephemeral_name(name)
+        profile_name = profile or sandbox_name
+        profile_config = self._ephemeral_profile(profile_name)
+        sandbox_id = f"{sandbox_name}-{uuid.uuid4().hex[:8]}"
+        options = SandboxCreateOptions(
+            name=sandbox_name,
+            image=self._ephemeral_profile_image(profile_config),
+            labels={
+                "deerflow.sandbox.kind": "ephemeral",
+                "deerflow.sandbox.name": sandbox_name,
+                "deerflow.sandbox.profile": profile_name,
+            },
+            ephemeral=True,
+        )
+        setup_commands = self._ephemeral_profile_setup_commands(profile_config)
+        environment = self._ephemeral_profile_environment(profile_config)
+
+        try:
+            self._create_ephemeral_sandbox(sandbox_id, options)
+            self._run_ephemeral_setup_commands(sandbox_id, setup_commands, environment)
+            return sandbox_id
+        except Exception:
+            self.destroy(sandbox_id)
+            raise
+
+    @staticmethod
+    def _sanitize_ephemeral_name(name: str) -> str:
+        sanitized = "".join(character if character.isalnum() or character in "._-" else "-" for character in name.strip())
+        return sanitized.strip(".-_") or "ephemeral"
+
+    def _ephemeral_profile(self, profile: str):
+        return (self._config.get("ephemeral_profiles") or {}).get(profile)
+
+    def _ephemeral_profile_image(self, profile_config) -> str:
+        image = getattr(profile_config, "image", None)
+        if isinstance(profile_config, dict):
+            image = profile_config.get("image")
+        return str(image or self._config["image"])
+
+    @staticmethod
+    def _ephemeral_profile_setup_commands(profile_config) -> list[str]:
+        commands = getattr(profile_config, "setup_commands", None)
+        if isinstance(profile_config, dict):
+            commands = profile_config.get("setup_commands")
+        return [str(command) for command in (commands or [])]
+
+    def _ephemeral_profile_environment(self, profile_config) -> dict[str, str]:
+        environment = getattr(profile_config, "environment", None)
+        if isinstance(profile_config, dict):
+            environment = profile_config.get("environment")
+        return self._resolve_env_vars(environment or {})
+
+    def _create_ephemeral_sandbox(self, sandbox_id: str, options: SandboxCreateOptions) -> str:
+        replicas, total = self._replica_count()
+        if total >= replicas:
+            evicted = self._evict_oldest_warm()
+            self._log_replicas_soft_cap(replicas, sandbox_id, evicted)
+
+        info = self._backend.create(None, sandbox_id, extra_mounts=None, options=options)
+        if not wait_for_sandbox_ready(info.sandbox_url, timeout=60):
+            self._backend.destroy(info)
+            raise RuntimeError(f"Ephemeral sandbox {sandbox_id} failed to become ready within timeout at {info.sandbox_url}")
+
+        sandbox = AioSandbox(id=sandbox_id, base_url=info.sandbox_url)
+        with self._lock:
+            self._sandboxes[sandbox_id] = sandbox
+            self._sandbox_infos[sandbox_id] = info
+            self._last_activity[sandbox_id] = time.time()
+            self._ephemeral_set().add(sandbox_id)
+        logger.info(f"Created ephemeral sandbox {sandbox_id} ({options.name}) at {info.sandbox_url}")
+        return sandbox_id
+
+    def _run_ephemeral_setup_commands(self, sandbox_id: str, commands: list[str], environment: dict[str, str]) -> None:
+        if not commands:
+            return
+        sandbox = self.get(sandbox_id)
+        if sandbox is None:
+            raise RuntimeError(f"Ephemeral sandbox {sandbox_id} is not available for setup")
+        env_prefix = " ".join(f"{shlex.quote(key)}={shlex.quote(value)}" for key, value in sorted(environment.items()))
+        for command in commands:
+            marker = f"__DEERFLOW_SETUP_EXIT__:{uuid.uuid4().hex}"
+            invocation = f"bash -lc {shlex.quote(command)}"
+            if env_prefix:
+                invocation = f"{env_prefix} {invocation}"
+            wrapped = f"{invocation}; status=$?; echo {marker}:$status; exit $status"
+            output = sandbox.execute_command(wrapped)
+            if f"{marker}:0" not in output:
+                raise RuntimeError(f"Ephemeral sandbox {sandbox_id} setup command failed: {command}\n{output}")
+
+    def _ephemeral_set(self) -> set[str]:
+        if not hasattr(self, "_ephemeral_sandboxes"):
+            self._ephemeral_sandboxes = set()
+        return self._ephemeral_sandboxes
 
     def _acquire_internal(self, thread_id: str | None) -> str:
         """Internal sandbox acquisition with two-layer consistency.
@@ -889,10 +1063,11 @@ class AioSandboxProvider(SandboxProvider):
         with self._lock:
             if not self._warm_pool:
                 return None
-            oldest_id = min(self._warm_pool, key=lambda sid: self._warm_pool[sid][1])
-            info, _ = self._warm_pool.pop(oldest_id)
+            oldest_id = min(self._warm_pool, key=lambda sid: _unpack_warm_pool_entry(self._warm_pool[sid])[1])
+            info, _, thread_ids = _unpack_warm_pool_entry(self._warm_pool.pop(oldest_id))
 
         try:
+            self._flush_warm_pool_artifacts(oldest_id, info, thread_ids, action="warm-pool eviction")
             self._backend.destroy(info)
             logger.info(f"Destroyed warm-pool sandbox {oldest_id}")
         except Exception as e:
@@ -981,6 +1156,11 @@ class AioSandboxProvider(SandboxProvider):
         Args:
             sandbox_id: The ID of the sandbox to release.
         """
+        if sandbox_id in self._ephemeral_set():
+            self.destroy(sandbox_id)
+            logger.info(f"Released ephemeral sandbox {sandbox_id} by destroying it")
+            return
+
         info = None
         sandbox = None
         thread_ids_to_remove: list[str] = []
@@ -994,14 +1174,10 @@ class AioSandboxProvider(SandboxProvider):
             self._last_activity.pop(sandbox_id, None)
             # Park in warm pool — container keeps running
             if info and sandbox_id not in self._warm_pool:
-                self._warm_pool[sandbox_id] = (info, time.time())
+                self._warm_pool[sandbox_id] = (info, time.time(), tuple(thread_ids_to_remove))
 
         if sandbox is not None:
-            for thread_id in thread_ids_to_remove:
-                try:
-                    self._flush_thread_artifacts(thread_id, sandbox)
-                except Exception as e:
-                    logger.warning(f"Failed to flush runtime artifacts for thread {thread_id} before sandbox release: {e}")
+            self._flush_thread_artifacts_for_threads(thread_ids_to_remove, sandbox, action="sandbox release")
             # Defense-in-depth: close() already swallows its own errors; this
             # guard only protects against a future close() that misbehaves, so
             # host-side client cleanup can never block parking in the warm pool.
@@ -1025,9 +1201,10 @@ class AioSandboxProvider(SandboxProvider):
         Args:
             sandbox_id: The ID of the sandbox to destroy.
         """
-        sandbox, info, _ = self._remove_tracked_sandbox(sandbox_id)
+        sandbox, info, thread_ids, _ = self._remove_tracked_sandbox(sandbox_id)
 
         if sandbox is not None:
+            self._flush_thread_artifacts_for_threads(thread_ids, sandbox, action="sandbox destroy")
             # Defense-in-depth: close() already swallows its own errors; this
             # guard only protects against a future close() that misbehaves, so
             # host-side client cleanup can never block container destruction.
@@ -1035,6 +1212,8 @@ class AioSandboxProvider(SandboxProvider):
                 sandbox.close()
             except Exception as e:
                 logger.warning(f"Error closing sandbox {sandbox_id} during destroy: {e}")
+        elif info is not None:
+            self._flush_warm_pool_artifacts(sandbox_id, info, tuple(thread_ids), action="sandbox destroy")
 
         if info:
             self._backend.destroy(info)
@@ -1064,8 +1243,10 @@ class AioSandboxProvider(SandboxProvider):
             except Exception as e:
                 logger.error(f"Failed to destroy sandbox {sandbox_id} during shutdown: {e}")
 
-        for sandbox_id, (info, _) in warm_items:
+        for sandbox_id, entry in warm_items:
+            info, _, thread_ids = _unpack_warm_pool_entry(entry)
             try:
+                self._flush_warm_pool_artifacts(sandbox_id, info, thread_ids, action="shutdown warm-pool destroy")
                 self._backend.destroy(info)
                 logger.info(f"Destroyed warm-pool sandbox {sandbox_id} during shutdown")
             except Exception as e:

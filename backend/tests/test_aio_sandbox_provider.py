@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from deerflow.artifacts.store import ACP_WORKSPACE_ROOT, InMemoryArtifactStore
 from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import Paths, join_host_path
 from deerflow.runtime.user_context import reset_current_user, set_current_user
@@ -196,6 +197,190 @@ def test_release_flushes_object_runtime_before_closing_sandbox(tmp_path, monkeyp
     sandbox.close.assert_called_once_with()
 
 
+def test_destroy_flushes_object_runtime_before_closing_sandbox(tmp_path, monkeypatch):
+    provider, sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-destroy")
+    provider._thread_sandboxes = {"thread-object": "sandbox-destroy"}
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj)))
+
+    provider.destroy("sandbox-destroy")
+
+    assert calls == [("thread-object", sandbox)]
+    sandbox.close.assert_called_once_with()
+    provider._backend.destroy.assert_called_once()
+
+
+def test_shutdown_flushes_object_runtime_before_destroying_active_sandboxes(tmp_path, monkeypatch):
+    provider, sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-shutdown")
+    provider._thread_sandboxes = {"thread-object": "sandbox-shutdown"}
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj)))
+
+    provider.shutdown()
+
+    assert calls == [("thread-object", sandbox)]
+    sandbox.close.assert_called_once_with()
+    provider._backend.destroy.assert_called_once()
+
+
+def test_drop_unhealthy_sandbox_flushes_object_runtime_before_close(tmp_path, monkeypatch):
+    provider, sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-unhealthy")
+    provider._thread_sandboxes = {"thread-object": "sandbox-unhealthy"}
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj)))
+
+    provider._drop_unhealthy_sandbox("sandbox-unhealthy", "failed health check")
+
+    assert calls == [("thread-object", sandbox)]
+    sandbox.close.assert_called_once_with()
+    provider._backend.destroy.assert_called_once()
+
+
+def test_destroy_flushes_warm_pool_object_runtime_before_backend_destroy(tmp_path, monkeypatch):
+    provider, _sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-warm")
+    info = provider._sandbox_infos.pop("sandbox-warm")
+    provider._sandboxes = {}
+    provider._thread_sandboxes = {}
+    provider._warm_pool = {"sandbox-warm": (info, 0.0, ("thread-object",))}
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj.id)))
+
+    provider.destroy("sandbox-warm")
+
+    assert calls == [("thread-object", "sandbox-warm")]
+    provider._backend.destroy.assert_called_once_with(info)
+
+
+def test_drop_unhealthy_sandbox_flushes_warm_pool_object_runtime_before_backend_destroy(tmp_path, monkeypatch):
+    provider, _sandbox, aio_mod = _make_provider_with_active_sandbox(tmp_path, "sandbox-warm-unhealthy")
+    info = provider._sandbox_infos.pop("sandbox-warm-unhealthy")
+    provider._sandboxes = {}
+    provider._thread_sandboxes = {}
+    provider._warm_pool = {"sandbox-warm-unhealthy": (info, 0.0, ("thread-object",))}
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(aio_mod.AioSandboxProvider, "_flush_thread_artifacts", lambda _self, thread_id, sandbox_obj: calls.append((thread_id, sandbox_obj.id)))
+
+    provider._drop_unhealthy_sandbox("sandbox-warm-unhealthy", "failed health check", expected_info=info)
+
+    assert calls == [("thread-object", "sandbox-warm-unhealthy")]
+    provider._backend.destroy.assert_called_once_with(info)
+
+
+def test_uses_thread_data_mounts_is_false_for_local_backend_object_runtime(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._backend = aio_mod.LocalContainerBackend(
+        image="sandbox-image",
+        base_port=8080,
+        container_prefix="sandbox",
+        config_mounts=[],
+        environment={},
+    )
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+
+    assert provider.uses_thread_data_mounts is False
+
+
+def test_materialize_thread_artifacts_passes_object_store_budget_config(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, sandbox, _ = _make_provider_with_active_sandbox(tmp_path, "sandbox-budget")
+    captured: dict[str, object] = {}
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {
+                    "bucket": "deerflow-runtime",
+                    "max_materialize_files": 7,
+                    "max_materialize_bytes": 99,
+                },
+            },
+        }
+    )
+    artifact_store = object()
+
+    class FakeMaterializer:
+        def __init__(self, store, **kwargs):
+            captured["store"] = store
+            captured["kwargs"] = kwargs
+
+        def materialize_thread(self, user_id, thread_id, sandbox_obj, *, roots=None):
+            captured["materialize"] = (user_id, thread_id, sandbox_obj)
+            captured["roots"] = roots
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "make_artifact_store", lambda _runtime_storage: artifact_store)
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: "user-1")
+    monkeypatch.setattr(aio_mod, "SandboxArtifactMaterializer", FakeMaterializer)
+
+    provider._materialize_thread_artifacts("thread-object", "sandbox-budget")
+
+    assert captured == {
+        "store": artifact_store,
+        "kwargs": {
+            "max_materialize_files": 7,
+            "max_materialize_bytes": 99,
+        },
+        "materialize": ("user-1", "thread-object", sandbox),
+        "roots": None,
+    }
+
+
+def test_refresh_thread_artifacts_materializes_active_sandbox_acp_root_only(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, sandbox, _ = _make_provider_with_active_sandbox(tmp_path, "sandbox-active")
+    provider._thread_sandboxes = {"thread-object": "sandbox-active"}
+    config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.community.aio_sandbox:AioSandboxProvider"},
+            "runtime_storage": {
+                "backend": "object",
+                "object_store": {"bucket": "deerflow-runtime"},
+            },
+        }
+    )
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-object", f"{ACP_WORKSPACE_ROOT}/result.txt", b"result")
+    store.put_bytes("user-1", "thread-object", "/mnt/user-data/outputs/leader.txt", b"leader")
+    sandbox.files = {}
+
+    def create_dir(path: str, *, parents: bool = True, exist_ok: bool = True) -> None:
+        sandbox.files.setdefault(path, None)
+
+    def update_file(path: str, content: bytes) -> None:
+        sandbox.files[path] = content
+
+    sandbox.create_dir.side_effect = create_dir
+    sandbox.update_file.side_effect = update_file
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "make_artifact_store", lambda _runtime_storage: store)
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: "user-1")
+
+    refreshed = provider.refresh_thread_artifacts("thread-object", roots=(ACP_WORKSPACE_ROOT,))
+
+    assert refreshed is True
+    assert sandbox.files[f"{ACP_WORKSPACE_ROOT}/result.txt"] == b"result"
+    assert "/mnt/user-data/outputs/leader.txt" not in sandbox.files
+    assert provider.refresh_thread_artifacts("missing-thread", roots=(ACP_WORKSPACE_ROOT,)) is False
+
+
 def test_get_thread_mounts_can_include_writable_db_skills_dir(tmp_path, monkeypatch):
     aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
     monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
@@ -233,6 +418,111 @@ def test_get_extra_mounts_uses_writable_db_skills_mount(tmp_path, monkeypatch):
     container_paths = {container_path: (host_path, read_only) for host_path, container_path, read_only in mounts}
 
     assert container_paths["/mnt/skills"] == (str(tmp_path / "threads" / "thread-db" / "skills"), False)
+
+
+def test_sandbox_config_accepts_ephemeral_profiles():
+    from deerflow.config.sandbox_config import SandboxConfig
+
+    config = SandboxConfig.model_validate(
+        {
+            "use": "deerflow.community.aio_sandbox:AioSandboxProvider",
+            "ephemeral_profiles": {
+                "codex": {
+                    "image": "registry.local/codex-acp:latest",
+                    "setup_commands": ["npm install -g @zed-industries/codex-acp"],
+                    "environment": {"OPENAI_API_KEY": "$OPENAI_API_KEY"},
+                }
+            },
+        }
+    )
+
+    profile = config.ephemeral_profiles["codex"]
+    assert profile.image == "registry.local/codex-acp:latest"
+    assert profile.setup_commands == ["npm install -g @zed-industries/codex-acp"]
+    assert profile.environment == {"OPENAI_API_KEY": "$OPENAI_API_KEY"}
+
+
+def test_acquire_ephemeral_uses_named_profile_without_thread_cache(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._thread_locks = {}
+    provider._warm_pool = {}
+    provider._sandboxes = {}
+    provider._sandbox_infos = {}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {
+        "replicas": 3,
+        "image": "default-aio:latest",
+        "ephemeral_profiles": {
+            "codex": SimpleNamespace(
+                image="registry.local/codex-acp:latest",
+                setup_commands=["echo setup"],
+                environment={"ACP_TOKEN": "token"},
+            )
+        },
+    }
+    created: list[dict[str, object]] = []
+    fake_sandboxes: dict[str, MagicMock] = {}
+
+    class FakeBackend:
+        destroy = MagicMock()
+
+        def create(self, thread_id, sandbox_id, extra_mounts=None, options=None):
+            created.append(
+                {
+                    "thread_id": thread_id,
+                    "sandbox_id": sandbox_id,
+                    "extra_mounts": extra_mounts,
+                    "options": options,
+                }
+            )
+            return aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url="http://sandbox")
+
+    def fake_aio_sandbox(id, base_url):
+        sandbox = MagicMock()
+        sandbox.id = id
+        sandbox.base_url = base_url
+
+        def fake_execute_command(command: str) -> str:
+            marker = next(part.split(":$status", 1)[0] for part in command.split() if part.startswith("__DEERFLOW_SETUP_EXIT__:"))
+            return f"{marker}:0"
+
+        sandbox.execute_command = MagicMock(side_effect=fake_execute_command)
+        sandbox.close = MagicMock()
+        fake_sandboxes[id] = sandbox
+        return sandbox
+
+    provider._backend = FakeBackend()
+    monkeypatch.setattr(aio_mod, "AioSandbox", fake_aio_sandbox)
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda _url, timeout=60: True)
+
+    sandbox_id = provider.acquire_ephemeral("codex")
+
+    assert sandbox_id in fake_sandboxes
+    assert provider._thread_sandboxes == {}
+    assert sandbox_id in provider._sandboxes
+    assert sandbox_id not in provider._warm_pool
+    assert created[0]["thread_id"] is None
+    assert created[0]["extra_mounts"] is None
+    options = created[0]["options"]
+    assert options.name == "codex"
+    assert options.image == "registry.local/codex-acp:latest"
+    assert options.ephemeral is True
+    assert options.labels["deerflow.sandbox.kind"] == "ephemeral"
+    assert options.labels["deerflow.sandbox.name"] == "codex"
+    fake_sandboxes[sandbox_id].execute_command.assert_called_once()
+    assert "echo setup" in fake_sandboxes[sandbox_id].execute_command.call_args.args[0]
+
+    provider.release(sandbox_id)
+
+    fake_sandboxes[sandbox_id].close.assert_called_once_with()
+    provider._backend.destroy.assert_called_once()
+    assert sandbox_id not in provider._warm_pool
+    assert sandbox_id not in provider._sandboxes
 
 
 def test_join_host_path_preserves_windows_drive_letter_style():

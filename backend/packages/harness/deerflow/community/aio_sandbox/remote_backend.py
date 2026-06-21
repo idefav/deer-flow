@@ -23,7 +23,7 @@ import requests
 
 from deerflow.runtime.user_context import get_effective_user_id
 
-from .backend import SandboxBackend
+from .backend import SandboxBackend, SandboxCreateOptions
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
@@ -62,13 +62,14 @@ class RemoteSandboxBackend(SandboxBackend):
         thread_id: str | None,
         sandbox_id: str,
         extra_mounts: list[tuple[str, str, bool]] | None = None,
+        options: SandboxCreateOptions | None = None,
     ) -> SandboxInfo:
         """Create a sandbox Pod + Service via the provisioner.
 
         Calls ``POST /api/sandboxes`` which creates a dedicated Pod +
         NodePort Service in k3s.
         """
-        return self._provisioner_create(thread_id, sandbox_id, extra_mounts)
+        return self._provisioner_create(thread_id, sandbox_id, extra_mounts, options=options)
 
     def destroy(self, info: SandboxInfo) -> None:
         """Destroy a sandbox Pod + Service via the provisioner."""
@@ -132,7 +133,13 @@ class RemoteSandboxBackend(SandboxBackend):
             logger.warning("Provisioner list_running failed: %s", exc)
             return []
 
-    def _provisioner_create(self, thread_id: str | None, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+    def _provisioner_create(
+        self,
+        thread_id: str | None,
+        sandbox_id: str,
+        extra_mounts: list[tuple[str, str, bool]] | None = None,
+        options: SandboxCreateOptions | None = None,
+    ) -> SandboxInfo:
         """POST /api/sandboxes → create Pod + Service."""
         payload = {
             "sandbox_id": sandbox_id,
@@ -148,6 +155,15 @@ class RemoteSandboxBackend(SandboxBackend):
                 }
                 for host_path, container_path, read_only in extra_mounts
             ]
+        if options is not None:
+            if options.name:
+                payload["name"] = options.name
+            if options.image:
+                payload["image"] = options.image
+            if options.labels:
+                payload["labels"] = dict(options.labels)
+            if options.ephemeral:
+                payload["ephemeral"] = True
 
         try:
             resp = requests.post(

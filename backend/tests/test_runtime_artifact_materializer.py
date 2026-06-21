@@ -1,5 +1,7 @@
+import pytest
+
 from deerflow.artifacts.sandbox_materializer import SandboxArtifactMaterializer
-from deerflow.artifacts.store import InMemoryArtifactStore
+from deerflow.artifacts.store import ACP_WORKSPACE_ROOT, InMemoryArtifactStore
 
 
 class FakeSandbox:
@@ -53,3 +55,62 @@ def test_flush_thread_uploads_sandbox_files_back_to_object_store():
     assert store.get_bytes("user-1", "thread-1", "/mnt/user-data/outputs/result.txt") == b"result"
     assert store.get_bytes("user-1", "thread-1", "/mnt/user-data/workspace/app.py") == b"print('done')\n"
     assert store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/subagent/result.json") == b'{"ok": true}'
+
+
+def test_flush_thread_deletes_object_store_files_missing_from_sandbox():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/outputs/stale.txt", b"stale")
+    store.put_bytes("user-1", "thread-1", "/mnt/acp-workspace/old.txt", b"old")
+    sandbox = FakeSandbox()
+    sandbox.files["/mnt/user-data/outputs/current.txt"] = b"current"
+
+    SandboxArtifactMaterializer(store).flush_thread("user-1", "thread-1", sandbox)
+
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-1", "/mnt/user-data/outputs/stale.txt")
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/old.txt")
+    assert store.get_bytes("user-1", "thread-1", "/mnt/user-data/outputs/current.txt") == b"current"
+
+
+def test_flush_thread_can_scope_roots_without_deleting_unselected_paths():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/outputs/leader.txt", b"leader")
+    store.put_bytes("user-1", "thread-1", "/mnt/acp-workspace/stale.txt", b"stale")
+    sandbox = FakeSandbox()
+    sandbox.files["/mnt/acp-workspace/result.txt"] = b"result"
+
+    SandboxArtifactMaterializer(store).flush_thread(
+        "user-1",
+        "thread-1",
+        sandbox,
+        roots=(ACP_WORKSPACE_ROOT,),
+    )
+
+    assert store.get_bytes("user-1", "thread-1", "/mnt/user-data/outputs/leader.txt") == b"leader"
+    assert store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/result.txt") == b"result"
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("user-1", "thread-1", "/mnt/acp-workspace/stale.txt")
+
+
+def test_materialize_thread_rejects_object_store_file_count_over_budget():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/uploads/one.txt", b"one")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/uploads/two.txt", b"two")
+    sandbox = FakeSandbox()
+
+    with pytest.raises(RuntimeError, match="max_materialize_files=1"):
+        SandboxArtifactMaterializer(store, max_materialize_files=1).materialize_thread("user-1", "thread-1", sandbox)
+
+    assert sandbox.files == {}
+
+
+def test_materialize_thread_rejects_object_store_bytes_over_budget():
+    store = InMemoryArtifactStore(prefix="deerflow")
+    store.put_bytes("user-1", "thread-1", "/mnt/user-data/uploads/input.txt", b"12345")
+    sandbox = FakeSandbox()
+
+    with pytest.raises(RuntimeError, match="max_materialize_bytes=4"):
+        SandboxArtifactMaterializer(store, max_materialize_bytes=4).materialize_thread("user-1", "thread-1", sandbox)
+
+    assert sandbox.files == {}

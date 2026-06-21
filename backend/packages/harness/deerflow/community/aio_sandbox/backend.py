@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 import httpx
 import requests
@@ -13,6 +14,16 @@ import requests
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SandboxCreateOptions:
+    """Optional backend creation settings for non-default sandbox allocations."""
+
+    name: str | None = None
+    image: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
+    ephemeral: bool = False
 
 
 def wait_for_sandbox_ready(sandbox_url: str, timeout: int = 30) -> bool:
@@ -74,7 +85,13 @@ class SandboxBackend(ABC):
     """
 
     @abstractmethod
-    def create(self, thread_id: str | None, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+    def create(
+        self,
+        thread_id: str | None,
+        sandbox_id: str,
+        extra_mounts: list[tuple[str, str, bool]] | None = None,
+        options: SandboxCreateOptions | None = None,
+    ) -> SandboxInfo:
         """Create/provision a new sandbox.
 
         Args:
@@ -82,6 +99,8 @@ class SandboxBackend(ABC):
             sandbox_id: Deterministic sandbox identifier.
             extra_mounts: Additional volume mounts as (host_path, container_path, read_only) tuples.
                 Ignored by backends that don't manage containers (e.g., remote).
+            options: Optional creation metadata such as image override, labels,
+                and whether this sandbox is ephemeral.
 
         Returns:
             SandboxInfo with connection details.

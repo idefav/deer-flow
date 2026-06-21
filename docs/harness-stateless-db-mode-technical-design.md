@@ -918,6 +918,7 @@ Implemented runtime paths:
 - AIO sandbox lifecycle materializes object files after create/discover/reclaim and flushes workspace/uploads/outputs/ACP files before release.
 - Object-mode sandbox creation uses PostgreSQL advisory locks instead of local lock files.
 - Bundled provisioner omits `/mnt/user-data`, rejects `USERDATA_PVC_NAME`, rejects extra mounts under `/mnt/user-data` or `/mnt/acp-workspace`, and records `runtime_storage_backend` in the mount-contract hash.
+- ACP gateway-side staging remains a file-mode/compatibility path; strict stateless mode runs ACP subprocesses inside named ephemeral AIO sandboxes and flushes their ACP workspace artifacts back through object storage.
 
 Open-source object storage recommendation:
 
@@ -930,6 +931,43 @@ Strict static gate:
 ```bash
 RUNTIME_STORAGE_BACKEND=object \
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate runtime_object_storage --json
+```
+
+### 10.5 ACP Sandbox-Native Execution
+
+ACP agents can still run in legacy gateway mode for file-mode compatibility. Strict stateless deployments should configure ACP agents with `execution_mode: sandbox`, `sandbox_scope: isolated`, and an optional `sandbox_profile` that points to `sandbox.ephemeral_profiles`.
+
+Example:
+
+```yaml
+sandbox:
+  use: deerflow.community.aio_sandbox:AioSandboxProvider
+  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
+  ephemeral_profiles:
+    codex:
+      image: registry.local/codex-acp:latest
+      setup_commands:
+        - npm install -g @zed-industries/codex-acp
+
+acp_agents:
+  codex:
+    command: codex-acp
+    args: ["--json"]
+    description: Codex ACP adapter
+    execution_mode: sandbox
+    sandbox_scope: isolated
+    sandbox_profile: codex
+```
+
+`AioSandboxProvider.acquire_ephemeral(name, profile)` creates a non-deterministic short-lived sandbox, applies the profile image/setup commands, and destroys the sandbox on release instead of parking it in the thread warm pool. Local Docker uses the profile image override and labels; remote provisioner payloads carry `name`, `image`, `labels`, and `ephemeral` so K8s can create the right Pod image.
+
+ACP sandbox-native invocation bridges the ACP stdio connection to the AIO bash session API. The gateway owns only the transport bridge; the ACP subprocess itself runs in the sandbox and uses `/mnt/acp-workspace` there as its working directory. Object mode materializes and flushes only the ACP workspace root for this ephemeral sandbox, so leader-owned `/mnt/user-data` objects are not deleted by ACP sandbox release. Object-backed sandbox-native ACP requires a `thread_id`; without it, the call fails closed because object-store ownership cannot be derived. After a successful ACP workspace flush, the provider refreshes the same thread's active leader sandbox with `roots=(/mnt/acp-workspace,)`, making ACP outputs visible to the next leader operation without rematerializing or deleting `/mnt/user-data/{workspace,uploads,outputs}`.
+
+The strict live-gate preflight rejects object-runtime configurations whose ACP agents still use gateway execution. The executable gate is opt-in and runs the sandbox-native ACP artifact visibility smoke:
+
+```bash
+DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1 \
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate acp_sandbox_native --run
 ```
 
 ---

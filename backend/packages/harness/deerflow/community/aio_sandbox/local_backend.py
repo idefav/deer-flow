@@ -15,7 +15,7 @@ from datetime import datetime
 
 from deerflow.utils.network import get_free_port, release_port
 
-from .backend import SandboxBackend, wait_for_sandbox_ready
+from .backend import SandboxBackend, SandboxCreateOptions, wait_for_sandbox_ready
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
@@ -259,13 +259,20 @@ class LocalContainerBackend(SandboxBackend):
 
     # ── SandboxBackend interface ──────────────────────────────────────────
 
-    def create(self, thread_id: str | None, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+    def create(
+        self,
+        thread_id: str | None,
+        sandbox_id: str,
+        extra_mounts: list[tuple[str, str, bool]] | None = None,
+        options: SandboxCreateOptions | None = None,
+    ) -> SandboxInfo:
         """Start a new container and return its connection info.
 
         Args:
             thread_id: Thread ID for which the sandbox is being created. Useful for backends that want to organize sandboxes by thread.
             sandbox_id: Deterministic sandbox identifier (used in container name).
             extra_mounts: Additional volume mounts as (host_path, container_path, read_only) tuples.
+            options: Optional creation metadata such as image override and labels.
 
         Returns:
             SandboxInfo with container details.
@@ -286,7 +293,7 @@ class LocalContainerBackend(SandboxBackend):
         for _attempt in range(10):
             port = get_free_port(start_port=_next_start)
             try:
-                container_id = self._start_container(container_name, port, extra_mounts)
+                container_id = self._start_container(container_name, port, extra_mounts, options=options)
                 break
             except RuntimeError as exc:
                 release_port(port)
@@ -515,6 +522,7 @@ class LocalContainerBackend(SandboxBackend):
         container_name: str,
         port: int,
         extra_mounts: list[tuple[str, str, bool]] | None = None,
+        options: SandboxCreateOptions | None = None,
     ) -> str:
         """Start a new container.
 
@@ -522,6 +530,7 @@ class LocalContainerBackend(SandboxBackend):
             container_name: Name for the container.
             port: Host port to map to container port 8080.
             extra_mounts: Additional volume mounts.
+            options: Optional creation metadata such as image override and labels.
 
         Returns:
             The container ID.
@@ -555,6 +564,15 @@ class LocalContainerBackend(SandboxBackend):
         for key, value in self._environment.items():
             cmd.extend(["-e", f"{key}={value}"])
 
+        if self._runtime == "docker":
+            labels = dict(options.labels) if options else {}
+            if options and options.name:
+                labels.setdefault("deerflow.sandbox.name", options.name)
+            if options and options.ephemeral:
+                labels.setdefault("deerflow.sandbox.ephemeral", "true")
+            for key, value in sorted(labels.items()):
+                cmd.extend(["--label", f"{key}={value}"])
+
         # Config-level volume mounts
         for mount in self._config_mounts:
             cmd.extend(
@@ -578,7 +596,8 @@ class LocalContainerBackend(SandboxBackend):
                     )
                 )
 
-        cmd.append(self._image)
+        image = options.image if options and options.image else self._image
+        cmd.append(image)
 
         log_cmd = _format_container_command_for_log(_redact_container_command_for_log(cmd))
         logger.info(f"Starting container using {self._runtime}: {log_cmd}")

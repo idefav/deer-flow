@@ -280,6 +280,8 @@ uv --directory backend run python scripts/check_stateless_live_gates.py --gate r
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate requires_llm --json
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate requires_llm --run --evidence-path /tmp/deerflow-requires-llm-bundle/evidence.json --evidence-log-dir logs
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate mcp_stateless --json
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate acp_sandbox_native --json
+DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1 uv --directory backend run python scripts/check_stateless_live_gates.py --gate acp_sandbox_native --run --evidence-path /tmp/deerflow-acp-sandbox-native-bundle/evidence.json --evidence-log-dir logs
 
 # A single evidence bundle can cover multiple gates by repeating --gate.
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate remote_live --gate requires_llm --run --evidence-path /tmp/deerflow-live-bundle/evidence.json --evidence-log-dir logs
@@ -288,7 +290,7 @@ uv --directory backend run python scripts/check_stateless_live_gates.py --gate r
 uv --directory backend run python scripts/check_stateless_live_gates.py --validate-evidence /tmp/deerflow-requires-llm-bundle/evidence.json --require-run --require-logs --json
 ```
 
-The preflight exits with code `0` only when selected gates have the required environment variables and config-source evidence to invoke their command. It exits with code `2` and reports `missing_env`, `invalid_env`, or `config_issues` when the command would only skip or be rejected by test preconditions. For `remote_live`, `invalid_env` includes malformed provisioner URLs, non-absolute host paths or prefixes, non-absolute container paths, and non-positive/non-integer ready timeouts. For `requires_llm`, file mode checks `DEER_FLOW_CONFIG_PATH` when it is set; otherwise it checks `DEER_FLOW_PROJECT_ROOT/config.yaml` when `DEER_FLOW_PROJECT_ROOT` is set; otherwise it checks the default project-root `config.yaml`. DB mode checks `DEER_FLOW_DATABASE_URL` and the `runtime_configs.app` payload using the same bootstrap DB URL parsing as gateway startup. For sqlite DB mode, the runtime DB file is `{sqlite_dir}/deerflow.db`, where `sqlite_dir` is derived from the URL path parent. `config_issues` includes missing `config.yaml`, missing `DEER_FLOW_CONFIG_PATH` file, invalid or missing `DEER_FLOW_PROJECT_ROOT`, missing DB URL, missing DB app config row, malformed YAML, an empty/invalid `models` list, or enabled stdio MCP servers that lack an explicit strict-stateless runtime mode. `mcp_stateless` accepts HTTP/SSE MCP servers and accepts enabled stdio MCP servers only when they declare `stateless.runtime_mode` as `sticky`, `sidecar`, or `single-node`; it records the same `mcp_compatibility` shape as migration dry-run. The model check recursively scans configured model entries for strings that start with `$`, such as `api_key: $OPENAI_API_KEY` or `api_key: $AZURE_OPENAI_API_KEY`, and reports absent variables in `missing_env`. Each gate report also includes `checked_env`, a sorted list of environment variable names checked by the preflight; this records names only, never values, so it can be archived without exposing credentials. Direct real-LLM pytest entrypoints, including `tests/test_client_live.py`, reuse this readiness contract and instantiate or preload models from the active file/DB AppConfig, so provider credentials are whatever the configured model references rather than a hard-coded `OPENAI_API_KEY` requirement.
+The preflight exits with code `0` only when selected gates have the required environment variables and config-source evidence to invoke their command. It exits with code `2` and reports `missing_env`, `invalid_env`, or `config_issues` when the command would only skip or be rejected by test preconditions. For `remote_live`, `invalid_env` includes malformed provisioner URLs, non-absolute host paths or prefixes, non-absolute container paths, and non-positive/non-integer ready timeouts. For `requires_llm`, file mode checks `DEER_FLOW_CONFIG_PATH` when it is set; otherwise it checks `DEER_FLOW_PROJECT_ROOT/config.yaml` when configured, then the default project-root `config.yaml`. DB mode checks `DEER_FLOW_DATABASE_URL` and the `runtime_configs.app` payload using the same bootstrap DB URL parsing as gateway startup. For sqlite DB mode, the runtime DB file is `{sqlite_dir}/deerflow.db`, where `sqlite_dir` is derived from the URL path parent. `config_issues` includes missing `config.yaml`, missing `DEER_FLOW_CONFIG_PATH` file, invalid or missing `DEER_FLOW_PROJECT_ROOT`, missing DB URL, missing DB app config row, malformed YAML, an empty/invalid `models` list, object-runtime ACP agents still configured with gateway execution, or enabled stdio MCP servers that lack an explicit strict-stateless runtime mode. `mcp_stateless` accepts HTTP/SSE MCP servers and accepts enabled stdio MCP servers only when they declare `stateless.runtime_mode` as `sticky`, `sidecar`, or `single-node`; it records the same `mcp_compatibility` shape as migration dry-run. `acp_sandbox_native` checks file/DB app config, requires `runtime_storage.backend=object` and `sandbox.use=AioSandboxProvider`, rejects configured ACP agents unless they use `execution_mode: sandbox` and `sandbox_scope: isolated`, and requires `DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1` before running `tests/test_acp_sandbox_native_live.py`. That live test starts an active leader sandbox and an isolated ephemeral ACP sandbox, flushes `/mnt/acp-workspace` through object storage, refreshes only that root into the leader sandbox, and verifies the marker is readable without using gateway `.deer-flow/.../acp-workspace` as the fact source. The model check recursively scans configured model entries for strings that start with `$`, such as `api_key: $OPENAI_API_KEY` or `api_key: $AZURE_OPENAI_API_KEY`, and reports absent variables in `missing_env`. Each gate report also includes `checked_env`, a sorted list of environment variable names checked by the preflight; this records names only, never values, so it can be archived without exposing credentials. Direct real-LLM pytest entrypoints, including `tests/test_client_live.py`, reuse this readiness contract and instantiate or preload models from the active file/DB AppConfig, so provider credentials are whatever the configured model references rather than a hard-coded `OPENAI_API_KEY` requirement.
 
 When `--evidence-path` is provided, the script writes a JSON evidence report containing `schema_version`, `generated_at_utc`, `cwd`, git source metadata (`repo_root`, `head`, `branch`, `dirty`, and `status_short_count` when available), the preflight report including `checked_env`, selected gates, whether `--run` was requested, each executed command and exit code, and the overall exit code; keep that file with rollout records for remote/live model sign-off. When `--evidence-log-dir` is also provided during `--run`, captured command stdout/stderr are written to that directory and each execution entry records `stdout_log_path`, `stdout_log_sha256`, `stdout_log_bytes`, `stderr_log_path`, `stderr_log_sha256`, and `stderr_log_bytes`; archive that log directory with the JSON evidence. For portable rollout bundles, prefer an evidence path such as `<bundle>/evidence.json` and a relative log directory such as `--evidence-log-dir logs`; the command writes logs under `<bundle>/logs/` and records `logs/...` paths in the JSON. Absolute log directories remain supported, but those evidence records are environment-specific.
 
@@ -352,6 +354,27 @@ unset USERDATA_PVC_NAME
 
 In object mode, the bundled provisioner fails closed if `USERDATA_PVC_NAME` is still set or if request-scoped extra mounts target `/mnt/user-data` or `/mnt/acp-workspace`. Sandbox Pods keep the skills mount, but runtime workspace/upload/output/ACP files are materialized through the AIO file API from object storage and flushed back before release.
 
+For strict stateless ACP, configure ACP agents to run inside an isolated ephemeral AIO sandbox instead of as gateway subprocesses:
+
+```yaml
+sandbox:
+  ephemeral_profiles:
+    codex:
+      image: registry.local/codex-acp:latest
+      setup_commands:
+        - npm install -g @zed-industries/codex-acp
+
+acp_agents:
+  codex:
+    command: codex-acp
+    description: Codex ACP adapter
+    execution_mode: sandbox
+    sandbox_scope: isolated
+    sandbox_profile: codex
+```
+
+Legacy `execution_mode: gateway` remains available for file-mode compatibility, but `acp_sandbox_native` rejects it for object-runtime stateless signing.
+
 Before switching production traffic, import existing runtime PVC or `.deer-flow` files:
 
 ```bash
@@ -377,8 +400,10 @@ uv --directory backend run python scripts/check_stateless_live_gates.py --gate r
 Production sign-off still requires live evidence. After the static gate passes, generate one portable evidence bundle for the runtime object-storage, remote, and model gates, then validate it:
 
 ```bash
+DEER_FLOW_RUN_ACP_SANDBOX_NATIVE=1 \
 uv --directory backend run python scripts/check_stateless_live_gates.py \
   --gate runtime_object_storage \
+  --gate acp_sandbox_native \
   --gate remote_live \
   --gate requires_llm \
   --run \

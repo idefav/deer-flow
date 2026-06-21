@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Mapping
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,18 @@ class ACPAgentConfig(BaseModel):
             "(allow_once preferred over allow_always). When False (default), all permission requests "
             "are denied — the agent must be configured to operate without requesting permissions."
         ),
+    )
+    execution_mode: Literal["gateway", "sandbox"] = Field(
+        default="gateway",
+        description="Where to launch the ACP agent process. 'gateway' preserves legacy behavior; 'sandbox' launches it inside an ephemeral AIO sandbox.",
+    )
+    sandbox_scope: Literal["isolated"] = Field(
+        default="isolated",
+        description="Sandbox allocation policy for execution_mode=sandbox. 'isolated' creates a per-invocation ephemeral sandbox.",
+    )
+    sandbox_profile: str | None = Field(
+        default=None,
+        description="Optional sandbox.ephemeral_profiles key to use for this ACP agent. Defaults to the ACP agent name.",
     )
 
 
