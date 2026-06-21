@@ -8422,6 +8422,58 @@ git diff --check produced no output.
 
 ---
 
+## Batch 134: Runtime Object Storage Close-Out Audit
+
+Date: 2026-06-21
+
+### Goal
+
+Record the post-implementation close-out audit for the runtime PVC removal work. This batch does not change product code; it records the authoritative current state after the object-storage implementation was committed and pushed.
+
+### Steps
+
+1. Confirm the worktree is clean on `feature/upgrade` and the branch is aligned with `origin/feature/upgrade`.
+2. Confirm the latest commit is `b1dea0c6 feat: add object storage runtime mode`.
+3. Re-run full backend regression after the final async-channel object-mode fix.
+4. Re-run full lint and whitespace checks.
+5. Update the requirement audit with the current full-regression count and keep the live-evidence gap explicit.
+
+### Files Changed
+
+- `docs/harness-stateless-db-mode-requirement-audit.md`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-close-out-audit-review.md`
+
+### Verification
+
+```bash
+uv --directory backend run pytest tests/blocking_io/test_channels_ingest.py::test_ingest_inbound_files_does_not_block_event_loop -q
+uv --directory backend run pytest -q
+uv --directory backend run ruff check .
+git diff --check
+git status --short --branch
+git ls-remote origin refs/heads/feature/upgrade
+```
+
+Result:
+
+```text
+1 passed, 1 warning in 0.70s
+4936 passed, 36 skipped, 12 warnings in 91.84s
+All checks passed!
+git diff --check produced no output.
+## feature/upgrade...origin/feature/upgrade
+b1dea0c6ff26d3a99e2ace557eb25834f66ac8b8 refs/heads/feature/upgrade
+```
+
+### Remaining Work
+
+- Execute `runtime_object_storage`, `remote_live`, and `requires_llm` gates in the target environment and archive evidence with logs.
+- Validate the archived evidence bundle with `--validate-evidence <bundle>/evidence.json --require-run --require-logs --json`.
+- Do not mark production stateless sign-off complete until that external evidence exists.
+
+---
+
 ## Batch 113: Runtime Object Storage Foundation
 
 Date: 2026-06-21
