@@ -281,6 +281,9 @@ uv --directory backend run python scripts/check_stateless_live_gates.py --gate r
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate requires_llm --run --evidence-path /tmp/deerflow-requires-llm-bundle/evidence.json --evidence-log-dir logs
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate mcp_stateless --json
 
+# A single evidence bundle can cover multiple gates by repeating --gate.
+uv --directory backend run python scripts/check_stateless_live_gates.py --gate remote_live --gate requires_llm --run --evidence-path /tmp/deerflow-live-bundle/evidence.json --evidence-log-dir logs
+
 # Validate an archived evidence file after a remote/model gate run.
 uv --directory backend run python scripts/check_stateless_live_gates.py --validate-evidence /tmp/deerflow-requires-llm-bundle/evidence.json --require-run --require-logs --json
 ```
@@ -371,11 +374,17 @@ RUNTIME_STORAGE_BACKEND=object \
 uv --directory backend run python scripts/check_stateless_live_gates.py --gate runtime_object_storage --json
 ```
 
-Production sign-off still requires live evidence. After the static gate passes, run remote/model gates and validate evidence:
+Production sign-off still requires live evidence. After the static gate passes, generate one portable evidence bundle for the runtime object-storage, remote, and model gates, then validate it:
 
 ```bash
-uv --directory backend run python scripts/check_stateless_live_gates.py --gate remote_live --run --evidence-path <bundle>/evidence.json --evidence-log-dir logs
-uv --directory backend run python scripts/check_stateless_live_gates.py --gate requires_llm --run --evidence-path <bundle>/evidence.json --evidence-log-dir logs
+uv --directory backend run python scripts/check_stateless_live_gates.py \
+  --gate runtime_object_storage \
+  --gate remote_live \
+  --gate requires_llm \
+  --run \
+  --evidence-path <bundle>/evidence.json \
+  --evidence-log-dir logs
+
 uv --directory backend run python scripts/check_stateless_live_gates.py --validate-evidence <bundle>/evidence.json --require-run --require-logs --json
 ```
 

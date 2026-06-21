@@ -43,4 +43,4 @@ b1dea0c6ff26d3a99e2ace557eb25834f66ac8b8 refs/heads/feature/upgrade
 
 - Production sign-off still requires live evidence from the target deployment.
 - Static preflight cannot prove object-store network reachability, credentials, bucket policy, or provisioner/K8s runtime behavior.
-- The required evidence bundle must include `runtime_object_storage`, `remote_live`, and `requires_llm` readiness/run records as applicable, plus logs validated with `--require-run --require-logs`.
+- The required evidence bundle should be generated with one repeated-`--gate` command that includes `runtime_object_storage`, `remote_live`, and `requires_llm`, plus logs validated with `--require-run --require-logs`.

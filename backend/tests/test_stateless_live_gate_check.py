@@ -394,6 +394,72 @@ def test_cli_writes_relative_execution_logs_next_to_evidence_bundle(tmp_path, mo
     assert validation["errors"] == []
 
 
+def test_cli_writes_single_evidence_bundle_for_multiple_gates(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "runtime_storage": {
+                    "backend": "object",
+                    "object_store": {"bucket": "deerflow-runtime"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "bundle"
+    evidence_path = bundle_path / "evidence.json"
+
+    class RunnerResult:
+        returncode = 0
+
+        def __init__(self, command: list[str]) -> None:
+            self.stdout = "stdout for " + " ".join(command) + "\n"
+            self.stderr = "stderr for " + " ".join(command) + "\n"
+
+        def __int__(self) -> int:
+            return self.returncode
+
+    def runner(command: list[str]) -> RunnerResult:
+        return RunnerResult(command)
+
+    exit_code = live_gate_check.main(
+        [
+            "--gate",
+            "docker_live",
+            "--gate",
+            "runtime_object_storage",
+            "--run",
+            "--evidence-path",
+            str(evidence_path),
+            "--evidence-log-dir",
+            "logs",
+        ],
+        env={
+            "DEER_FLOW_RUN_LIVE_AIO_SANDBOX": "1",
+            "DEER_FLOW_CONFIG_PATH": str(config_path),
+            "RUNTIME_STORAGE_BACKEND": "object",
+        },
+        runner=runner,
+        stdout=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["selected_gates"] == ["docker_live", "runtime_object_storage"]
+    assert [execution["gate"] for execution in evidence["executions"]] == ["docker_live", "runtime_object_storage"]
+    assert evidence["executions"][0]["stdout_log_path"] == "logs/001-docker_live.stdout.log"
+    assert evidence["executions"][1]["stdout_log_path"] == "logs/002-runtime_object_storage.stdout.log"
+
+    stdout = io.StringIO()
+    validation_exit_code = live_gate_check.main(
+        ["--validate-evidence", str(evidence_path), "--require-run", "--require-logs", "--json"],
+        stdout=stdout,
+    )
+
+    assert validation_exit_code == 0
+
+
 def test_cli_validates_successful_evidence_file(tmp_path):
     evidence_path = tmp_path / "successful-evidence.json"
     evidence_path.write_text(

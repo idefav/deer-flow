@@ -8474,6 +8474,49 @@ b1dea0c6ff26d3a99e2ace557eb25834f66ac8b8 refs/heads/feature/upgrade
 
 ---
 
+## Batch 135: Multi-Gate Live Evidence Bundle Guidance
+
+Date: 2026-06-21
+
+### Goal
+
+Align production sign-off guidance with the live-gate CLI's multi-gate evidence behavior. The CLI already supports repeated `--gate` arguments, so runtime-object, remote, and model gates should be archived in one evidence JSON instead of using multiple commands that target the same `<bundle>/evidence.json`.
+
+### Steps
+
+1. Add a regression test proving one `--evidence-path` can contain multiple selected gates, executions, and relative log paths.
+2. Update the operator runbook to use repeated `--gate` arguments for production sign-off.
+3. Update the requirement audit to reference the single portable evidence bundle.
+4. Add a review note documenting why this avoids evidence overwrite ambiguity.
+
+### Files Changed
+
+- `backend/tests/test_stateless_live_gate_check.py`
+- `docs/harness-stateless-db-mode-operator-runbook.md`
+- `docs/harness-stateless-db-mode-requirement-audit.md`
+- `docs/harness-stateless-db-mode-implementation-log.md`
+- `docs/reviews/harness-stateless-object-storage-2026-06-21-multi-gate-evidence-review.md`
+
+### Verification
+
+```bash
+uv --directory backend run pytest tests/test_stateless_live_gate_check.py::test_cli_writes_single_evidence_bundle_for_multiple_gates -q
+```
+
+Result:
+
+```text
+1 passed, 1 warning in 0.31s
+```
+
+### Remaining Work
+
+- Execute the documented multi-gate evidence command in the target environment:
+  `uv --directory backend run python scripts/check_stateless_live_gates.py --gate runtime_object_storage --gate remote_live --gate requires_llm --run --evidence-path <bundle>/evidence.json --evidence-log-dir logs`
+- Validate the archived bundle with `--validate-evidence <bundle>/evidence.json --require-run --require-logs --json`.
+
+---
+
 ## Batch 113: Runtime Object Storage Foundation
 
 Date: 2026-06-21
