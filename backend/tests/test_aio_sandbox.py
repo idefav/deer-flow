@@ -3,7 +3,7 @@
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -285,6 +285,39 @@ class TestConcurrentFileWrites:
 
 
 class TestFileOperations:
+    def test_materializer_writes_context_files_through_aio_file_api(self, sandbox):
+        from deerflow.sandbox.materializer import SandboxMaterializedFile, SandboxMaterializer, SandboxMaterializerManifest
+
+        sandbox._client.file.read_file = MagicMock(side_effect=FileNotFoundError)
+        sandbox._client.shell.exec_command = MagicMock(return_value=SimpleNamespace(data=SimpleNamespace(output='{"ok": true}')))
+        sandbox._client.file.write_file = MagicMock()
+
+        SandboxMaterializer().materialize(
+            sandbox,
+            SandboxMaterializerManifest(
+                files=[
+                    SandboxMaterializedFile(path="agent/SOUL.md", content="Remote soul"),
+                    SandboxMaterializedFile(path="skills/custom/research/assets/logo.bin", content=b"\x00skill"),
+                ],
+                revision="rev-aio",
+            ),
+        )
+
+        sandbox._client.file.write_file.assert_has_calls(
+            [
+                call(file="/tmp/deerflow/context/agent/SOUL.md", content="Remote soul"),
+                call(
+                    file="/tmp/deerflow/context/skills/custom/research/assets/logo.bin",
+                    content="AHNraWxs",
+                    encoding="base64",
+                ),
+            ],
+            any_order=True,
+        )
+        manifest_call = sandbox._client.file.write_file.call_args_list[-1]
+        assert manifest_call.kwargs["file"] == "/tmp/deerflow/context/.manifest.json"
+        assert "manifest_hash" in manifest_call.kwargs["content"]
+
     def test_get_metadata_parses_shell_json(self, sandbox):
         calls = []
 

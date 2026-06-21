@@ -86,6 +86,45 @@ def test_get_thread_mounts_includes_user_data_dirs(tmp_path, monkeypatch):
     assert "/mnt/user-data/outputs" in container_paths
 
 
+def test_get_thread_mounts_can_include_writable_db_skills_dir(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: None)
+
+    mounts = aio_mod.AioSandboxProvider._get_thread_mounts(
+        "thread-db",
+        include_db_skills_mount=True,
+        skills_container_path="/mnt/skills",
+    )
+    container_paths = {container_path: (host_path, read_only) for host_path, container_path, read_only in mounts}
+
+    expected_host = str(tmp_path / "threads" / "thread-db" / "skills")
+    assert container_paths["/mnt/skills"] == (expected_host, False)
+    assert (tmp_path / "threads" / "thread-db" / "skills").exists()
+    assert oct((tmp_path / "threads" / "thread-db" / "skills").stat().st_mode & 0o777) == oct(0o777)
+
+
+def test_get_extra_mounts_uses_writable_db_skills_mount(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    config = SimpleNamespace(skills=SimpleNamespace(container_path="/mnt/skills"))
+
+    monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
+    monkeypatch.setattr(aio_mod, "get_effective_user_id", lambda: None)
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "is_db_config_enabled", lambda: True)
+    monkeypatch.setattr(
+        aio_mod,
+        "get_or_new_skill_storage",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("file-backed skills mount should not be used in DB mode")),
+    )
+
+    mounts = aio_mod.AioSandboxProvider._get_extra_mounts(provider, "thread-db")
+    container_paths = {container_path: (host_path, read_only) for host_path, container_path, read_only in mounts}
+
+    assert container_paths["/mnt/skills"] == (str(tmp_path / "threads" / "thread-db" / "skills"), False)
+
+
 def test_join_host_path_preserves_windows_drive_letter_style():
     base = r"C:\Users\demo\deer-flow\backend\.deer-flow"
 
@@ -109,6 +148,26 @@ def test_get_thread_mounts_preserves_windows_host_path_style(tmp_path, monkeypat
     assert container_paths["/mnt/user-data/uploads"] == r"C:\Users\demo\deer-flow\backend\.deer-flow\threads\thread-10\user-data\uploads"
     assert container_paths["/mnt/user-data/outputs"] == r"C:\Users\demo\deer-flow\backend\.deer-flow\threads\thread-10\user-data\outputs"
     assert container_paths["/mnt/acp-workspace"] == r"C:\Users\demo\deer-flow\backend\.deer-flow\threads\thread-10\acp-workspace"
+
+
+def test_get_skills_mount_uses_active_skill_storage_root(tmp_path, monkeypatch):
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    configured_skills_dir = tmp_path / "configured-skills"
+    configured_skills_dir.mkdir()
+    storage_root = tmp_path / "db-materialized-skills"
+    storage_root.mkdir()
+    config = SimpleNamespace(
+        skills=SimpleNamespace(container_path="/mnt/skills", get_skills_path=lambda: configured_skills_dir),
+    )
+    storage = SimpleNamespace(get_skills_root_path=lambda: storage_root)
+    monkeypatch.delenv("DEER_FLOW_HOST_SKILLS_PATH", raising=False)
+
+    monkeypatch.setattr(aio_mod, "get_app_config", lambda: config)
+    monkeypatch.setattr(aio_mod, "get_or_new_skill_storage", lambda **_kwargs: storage, raising=False)
+
+    mount = aio_mod.AioSandboxProvider._get_skills_mount()
+
+    assert mount == (str(storage_root), "/mnt/skills", True)
 
 
 def test_discover_or_create_only_unlocks_when_lock_succeeds(tmp_path, monkeypatch):
@@ -370,6 +429,49 @@ def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
         "thread_id": "thread-42",
         "user_id": "user-7",
     }
+
+
+def test_remote_backend_create_forwards_extra_mounts(monkeypatch):
+    """Provisioner mode must receive mount requirements such as writable DB skills path."""
+    remote_mod = importlib.import_module("deerflow.community.aio_sandbox.remote_backend")
+    backend = remote_mod.RemoteSandboxBackend("http://provisioner:8002")
+    posted: dict = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"sandbox_url": "http://sandbox.local"}
+
+    def _post(url, json, timeout):  # noqa: A002 - mirrors requests.post kwarg
+        posted.update({"url": url, "json": json, "timeout": timeout})
+        return _Response()
+
+    monkeypatch.setattr(remote_mod.requests, "post", _post)
+    monkeypatch.setattr(remote_mod, "get_effective_user_id", lambda: "user-7")
+
+    backend.create(
+        "thread-42",
+        "sandbox-42",
+        extra_mounts=[
+            ("/host/thread/skills", "/mnt/skills", False),
+            ("/host/thread/acp-workspace", "/mnt/acp-workspace", True),
+        ],
+    )
+
+    assert posted["json"]["extra_mounts"] == [
+        {
+            "host_path": "/host/thread/skills",
+            "container_path": "/mnt/skills",
+            "read_only": False,
+        },
+        {
+            "host_path": "/host/thread/acp-workspace",
+            "container_path": "/mnt/acp-workspace",
+            "read_only": True,
+        },
+    ]
 
 
 # ── Sandbox client teardown (#2872) ──────────────────────────────────────────

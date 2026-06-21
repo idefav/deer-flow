@@ -9,11 +9,13 @@ import logging
 import math
 import re
 import uuid
+from enum import StrEnum
 from typing import Any
 
 from deerflow.agents.memory.prompt import (
     MEMORY_UPDATE_PROMPT,
     format_conversation_for_update,
+    format_memory_for_update_prompt,
 )
 from deerflow.agents.memory.storage import (
     create_empty_memory,
@@ -36,6 +38,12 @@ _SYNC_MEMORY_UPDATER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="memory-updater-sync",
 )
 atexit.register(lambda: _SYNC_MEMORY_UPDATER_EXECUTOR.shutdown(wait=False))
+
+
+class MemoryUpdateFailureReason(StrEnum):
+    """Typed reason for the last failed memory update attempt."""
+
+    SAVE_RETRY_EXHAUSTED = "save_retry_exhausted"
 
 
 def _create_empty_memory() -> dict[str, Any]:
@@ -387,6 +395,12 @@ class MemoryUpdater:
             model_name: Optional model name to use. If None, uses config or default.
         """
         self._model_name = model_name
+        self._last_failure_reason: MemoryUpdateFailureReason | None = None
+
+    @property
+    def last_failure_reason(self) -> MemoryUpdateFailureReason | None:
+        """Return the typed reason for the most recent failed update, if any."""
+        return self._last_failure_reason
 
     def _get_model(self):
         """Get the model for memory updates."""
@@ -442,7 +456,11 @@ class MemoryUpdater:
             reinforcement_detected=reinforcement_detected,
         )
         prompt = MEMORY_UPDATE_PROMPT.format(
-            current_memory=json.dumps(current_memory, indent=2, ensure_ascii=False),
+            current_memory=format_memory_for_update_prompt(
+                current_memory,
+                max_tokens=config.max_update_context_tokens,
+                use_tiktoken=config.token_counting == "tiktoken",
+            ),
             conversation=conversation_text,
             correction_hint=correction_hint,
         )
@@ -458,11 +476,25 @@ class MemoryUpdater:
     ) -> bool:
         """Parse the model response, apply updates, and persist memory."""
         update_data = _parse_memory_update_response(response_content)
+        storage = get_memory_storage()
+
         # Deep-copy before in-place mutation so a subsequent save() failure
         # cannot corrupt the still-cached original object reference.
         updated_memory = self._apply_updates(copy.deepcopy(current_memory), update_data, thread_id)
         updated_memory = _strip_upload_mentions_from_memory(updated_memory)
-        return get_memory_storage().save(updated_memory, agent_name, user_id=user_id)
+        if storage.save(updated_memory, agent_name, user_id=user_id):
+            self._last_failure_reason = None
+            return True
+
+        logger.info("Memory save failed; reloading latest memory and retrying once")
+        latest_memory = storage.reload(agent_name, user_id=user_id)
+        retried_memory = self._apply_updates(copy.deepcopy(latest_memory), update_data, thread_id)
+        retried_memory = _strip_upload_mentions_from_memory(retried_memory)
+        if storage.save(retried_memory, agent_name, user_id=user_id):
+            self._last_failure_reason = None
+            return True
+        self._last_failure_reason = MemoryUpdateFailureReason.SAVE_RETRY_EXHAUSTED
+        return False
 
     async def aupdate_memory(
         self,

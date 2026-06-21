@@ -9,7 +9,8 @@ Core principle: use the real LLM from config.yaml, let config, middleware
 chain, tool registration, file I/O, and event serialization all run for real.
 Only DEER_FLOW_HOME is redirected to tmp_path for filesystem isolation.
 
-Tests that call the LLM are marked ``requires_llm`` and skipped in CI.
+Tests that call the LLM are marked ``requires_llm`` and skipped unless the
+active file/DB model config is ready for the model-backed live gate.
 File-management tests (upload/list/delete) don't need LLM and run everywhere.
 """
 
@@ -21,9 +22,11 @@ from pathlib import Path
 
 import pytest
 from dotenv import load_dotenv
+from support.live_gate_readiness import load_active_app_config_for_requires_llm, mark_requires_llm, requires_llm_skip_reason
 
 from deerflow.client import DeerFlowClient, StreamEvent
 from deerflow.config.app_config import AppConfig
+from deerflow.config.sandbox_config import SandboxConfig
 
 # Load .env from project root (for OPENAI_API_KEY etc.)
 load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
@@ -32,10 +35,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
 # Markers
 # ---------------------------------------------------------------------------
 
-requires_llm = pytest.mark.skipif(
-    os.getenv("CI", "").lower() in ("true", "1") or not os.getenv("OPENAI_API_KEY"),
-    reason="Requires LLM API key — skipped in CI or when OPENAI_API_KEY is unset",
-)
+
+def requires_llm(test_func):
+    return mark_requires_llm(test_func)
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +45,18 @@ requires_llm = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
-def _make_e2e_config() -> AppConfig:
-    """Build a minimal AppConfig using real LLM credentials from environment.
+def _make_legacy_e2e_config() -> AppConfig:
+    """Build a minimal AppConfig for non-LLM E2E tests in unconfigured environments.
 
-    All LLM connection details come from environment variables so that both
-    internal CI and external contributors can run the tests:
+    This preserves the historical local behavior for tests that don't call the
+    model. Real LLM tests use the active AppConfig when the live-gate preflight
+    says it is ready.
 
     - ``E2E_MODEL_NAME``  (default: ``volcengine-ark``)
     - ``E2E_MODEL_USE``   (default: ``langchain_openai:ChatOpenAI``)
     - ``E2E_MODEL_ID``    (default: ``ep-20251211175242-llcmh``)
     - ``E2E_BASE_URL``    (default: ``https://ark-cn-beijing.bytedance.net/api/v3``)
-    - ``OPENAI_API_KEY``  (required for LLM tests)
+    - ``OPENAI_API_KEY``  (legacy fallback only; active live gates use config refs)
 
     Note: We use model_validate with a raw dict (not AppConfig(models=[ModelConfig(...)]))
     because passing already-validated Pydantic instances triggers a pydantic-core
@@ -82,6 +85,23 @@ def _make_e2e_config() -> AppConfig:
                 "allow_host_bash": True,
             },
         }
+    )
+
+
+def _make_e2e_config() -> AppConfig:
+    """Use the active model config when live gates are ready, otherwise a local fallback."""
+    if requires_llm_skip_reason() is not None:
+        return _make_legacy_e2e_config()
+
+    config = load_active_app_config_for_requires_llm()
+    return config.model_copy(
+        update={
+            "sandbox": SandboxConfig(
+                use="deerflow.sandbox.local:LocalSandboxProvider",
+                allow_host_bash=True,
+            )
+        },
+        deep=True,
     )
 
 
@@ -153,7 +173,7 @@ def e2e_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr("deerflow.client.build_middlewares", _sync_safe_build_middlewares)
 
-    return {"tmp_path": tmp_path}
+    return {"tmp_path": tmp_path, "config": config}
 
 
 @pytest.fixture()
@@ -640,22 +660,22 @@ class TestConfigManagement:
 
     def test_list_models_returns_injected_config(self, e2e_env):
         """list_models() returns the model from the injected AppConfig."""
-        expected_model_name = os.getenv("E2E_MODEL_NAME", "volcengine-ark")
+        expected_model = e2e_env["config"].models[0]
         c = DeerFlowClient(checkpointer=None, thinking_enabled=False)
         result = c.list_models()
         assert "models" in result
         assert len(result["models"]) == 1
-        assert result["models"][0]["name"] == expected_model_name
-        assert result["models"][0]["display_name"] == "E2E Test Model"
+        assert result["models"][0]["name"] == expected_model.name
+        assert result["models"][0]["display_name"] == expected_model.display_name
 
     def test_get_model_found(self, e2e_env):
         """get_model() returns the model when it exists."""
-        expected_model_name = os.getenv("E2E_MODEL_NAME", "volcengine-ark")
+        expected_model = e2e_env["config"].models[0]
         c = DeerFlowClient(checkpointer=None, thinking_enabled=False)
-        model = c.get_model(expected_model_name)
+        model = c.get_model(expected_model.name)
         assert model is not None
-        assert model["name"] == expected_model_name
-        assert model["supports_thinking"] is False
+        assert model["name"] == expected_model.name
+        assert model["supports_thinking"] is expected_model.supports_thinking
 
     def test_get_model_not_found(self, e2e_env):
         """get_model() returns None for nonexistent model."""

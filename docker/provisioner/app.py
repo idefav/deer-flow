@@ -29,6 +29,8 @@ Architecture (docker-compose-dev):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -65,6 +67,8 @@ USERDATA_PVC_NAME = os.environ.get("USERDATA_PVC_NAME", "")
 SAFE_THREAD_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 SAFE_USER_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 DEFAULT_USER_ID = "default"
+MOUNT_CONTRACT_HASH_ANNOTATION = "deerflow.io/mount-contract-hash"
+MOUNT_CONTRACT_PATHS_ANNOTATION = "deerflow.io/mount-contract-paths"
 
 # Path to the kubeconfig *inside* the provisioner container.
 # Typically the host's ~/.kube/config is mounted here.
@@ -212,16 +216,26 @@ app = FastAPI(title="DeerFlow Sandbox Provisioner", lifespan=lifespan)
 # ── Request / Response models ───────────────────────────────────────────
 
 
+class ExtraMount(BaseModel):
+    host_path: str
+    container_path: str
+    read_only: bool = False
+
+
 class CreateSandboxRequest(BaseModel):
     sandbox_id: str
     thread_id: str = Field(pattern=SAFE_THREAD_ID_PATTERN)
     user_id: str = Field(default=DEFAULT_USER_ID, pattern=SAFE_USER_ID_PATTERN)
+    extra_mounts: list[ExtraMount] = Field(default_factory=list)
 
 
 class SandboxResponse(BaseModel):
     sandbox_id: str
     sandbox_url: str  # Direct access URL, e.g. http://host.docker.internal:{NodePort}
     status: str
+
+
+CreateSandboxRequest.model_rebuild(_types_namespace={"ExtraMount": ExtraMount})
 
 
 # ── K8s resource helpers ─────────────────────────────────────────────────
@@ -240,7 +254,65 @@ def _sandbox_url(node_port: int) -> str:
     return f"http://{NODE_HOST}:{node_port}"
 
 
-def _build_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
+def _extra_mount_volume_name(index: int) -> str:
+    return f"extra-mount-{index}"
+
+
+def _mount_contract_payload(extra_mounts: list[ExtraMount] | None = None) -> list[dict[str, object]]:
+    return [
+        {
+            "host_path": mount.host_path,
+            "container_path": mount.container_path,
+            "read_only": mount.read_only,
+        }
+        for mount in extra_mounts or []
+    ]
+
+
+def _mount_contract_hash(extra_mounts: list[ExtraMount] | None = None) -> str:
+    payload = json.dumps(_mount_contract_payload(extra_mounts), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _mount_contract_annotations(extra_mounts: list[ExtraMount] | None = None) -> dict[str, str]:
+    container_paths = ",".join(mount.container_path for mount in extra_mounts or [])
+    return {
+        MOUNT_CONTRACT_HASH_ANNOTATION: _mount_contract_hash(extra_mounts),
+        MOUNT_CONTRACT_PATHS_ANNOTATION: container_paths,
+    }
+
+
+def _read_pod_mount_contract_hash(sandbox_id: str) -> str | None:
+    pod = core_v1.read_namespaced_pod(_pod_name(sandbox_id), K8S_NAMESPACE)
+    annotations = getattr(getattr(pod, "metadata", None), "annotations", None) or {}
+    return annotations.get(MOUNT_CONTRACT_HASH_ANNOTATION)
+
+
+def _ensure_existing_mount_contract(sandbox_id: str, extra_mounts: list[ExtraMount]) -> None:
+    expected_hash = _mount_contract_hash(extra_mounts)
+    try:
+        actual_hash = _read_pod_mount_contract_hash(sandbox_id)
+    except ApiException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read existing sandbox Pod mount contract: {exc.reason}",
+        ) from exc
+
+    if actual_hash is None and not extra_mounts:
+        return
+    if actual_hash == expected_hash:
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Existing sandbox '{sandbox_id}' has a different mount contract; "
+            "destroy it before retrying this request."
+        ),
+    )
+
+
+def _build_default_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
     """Build volume list: PVC when configured, otherwise hostPath."""
     if SKILLS_PVC_NAME:
         skills_vol = k8s_client.V1Volume(
@@ -278,7 +350,32 @@ def _build_volumes(thread_id: str) -> list[k8s_client.V1Volume]:
     return [skills_vol, userdata_vol]
 
 
-def _build_volume_mounts(thread_id: str, user_id: str = DEFAULT_USER_ID) -> list[k8s_client.V1VolumeMount]:
+def _build_volumes(thread_id: str, extra_mounts: list[ExtraMount] | None = None) -> list[k8s_client.V1Volume]:
+    """Build volume list and allow request-scoped extra mounts to override paths."""
+    extra_mounts = extra_mounts or []
+    extra_container_paths = {mount.container_path for mount in extra_mounts}
+    volumes = [
+        volume
+        for volume in _build_default_volumes(thread_id)
+        if not (
+            volume.name == "skills"
+            and "/mnt/skills" in extra_container_paths
+        )
+    ]
+    for index, mount in enumerate(extra_mounts):
+        volumes.append(
+            k8s_client.V1Volume(
+                name=_extra_mount_volume_name(index),
+                host_path=k8s_client.V1HostPathVolumeSource(
+                    path=mount.host_path,
+                    type="DirectoryOrCreate",
+                ),
+            )
+        )
+    return volumes
+
+
+def _build_default_volume_mounts(thread_id: str, user_id: str = DEFAULT_USER_ID) -> list[k8s_client.V1VolumeMount]:
     """Build volume mount list, using subPath for PVC user-data."""
     userdata_mount = k8s_client.V1VolumeMount(
         name="user-data",
@@ -298,12 +395,42 @@ def _build_volume_mounts(thread_id: str, user_id: str = DEFAULT_USER_ID) -> list
     ]
 
 
-def _build_pod(sandbox_id: str, thread_id: str, user_id: str = DEFAULT_USER_ID) -> k8s_client.V1Pod:
+def _build_volume_mounts(
+    thread_id: str,
+    user_id: str = DEFAULT_USER_ID,
+    extra_mounts: list[ExtraMount] | None = None,
+) -> list[k8s_client.V1VolumeMount]:
+    """Build volume mounts and allow request-scoped extra mounts to override paths."""
+    extra_mounts = extra_mounts or []
+    extra_container_paths = {mount.container_path for mount in extra_mounts}
+    mounts = [
+        mount
+        for mount in _build_default_volume_mounts(thread_id, user_id=user_id)
+        if mount.mount_path not in extra_container_paths
+    ]
+    for index, mount in enumerate(extra_mounts):
+        mounts.append(
+            k8s_client.V1VolumeMount(
+                name=_extra_mount_volume_name(index),
+                mount_path=mount.container_path,
+                read_only=mount.read_only,
+            )
+        )
+    return mounts
+
+
+def _build_pod(
+    sandbox_id: str,
+    thread_id: str,
+    user_id: str = DEFAULT_USER_ID,
+    extra_mounts: list[ExtraMount] | None = None,
+) -> k8s_client.V1Pod:
     """Construct a Pod manifest for a single sandbox."""
     return k8s_client.V1Pod(
         metadata=k8s_client.V1ObjectMeta(
             name=_pod_name(sandbox_id),
             namespace=K8S_NAMESPACE,
+            annotations=_mount_contract_annotations(extra_mounts),
             labels={
                 "app": "deer-flow-sandbox",
                 "sandbox-id": sandbox_id,
@@ -356,14 +483,14 @@ def _build_pod(sandbox_id: str, thread_id: str, user_id: str = DEFAULT_USER_ID) 
                             "ephemeral-storage": "500Mi",
                         },
                     ),
-                    volume_mounts=_build_volume_mounts(thread_id, user_id=user_id),
+                    volume_mounts=_build_volume_mounts(thread_id, user_id=user_id, extra_mounts=extra_mounts),
                     security_context=k8s_client.V1SecurityContext(
                         privileged=False,
                         allow_privilege_escalation=True,
                     ),
                 )
             ],
-            volumes=_build_volumes(thread_id),
+            volumes=_build_volumes(thread_id, extra_mounts=extra_mounts),
             restart_policy="Always",
         ),
     )
@@ -440,6 +567,7 @@ async def create_sandbox(req: CreateSandboxRequest):
     sandbox_id = req.sandbox_id
     thread_id = req.thread_id
     user_id = req.user_id
+    extra_mounts = req.extra_mounts
 
     logger.info(
         "Received request to create sandbox '%s' for thread '%s' user '%s'",
@@ -451,6 +579,7 @@ async def create_sandbox(req: CreateSandboxRequest):
     # ── Fast path: sandbox already exists ────────────────────────────
     existing_port = _get_node_port(sandbox_id)
     if existing_port:
+        _ensure_existing_mount_contract(sandbox_id, extra_mounts)
         return SandboxResponse(
             sandbox_id=sandbox_id,
             sandbox_url=_sandbox_url(existing_port),
@@ -459,7 +588,7 @@ async def create_sandbox(req: CreateSandboxRequest):
 
     # ── Create Pod ───────────────────────────────────────────────────
     try:
-        core_v1.create_namespaced_pod(K8S_NAMESPACE, _build_pod(sandbox_id, thread_id, user_id=user_id))
+        core_v1.create_namespaced_pod(K8S_NAMESPACE, _build_pod(sandbox_id, thread_id, user_id=user_id, extra_mounts=extra_mounts))
         logger.info(f"Created Pod {_pod_name(sandbox_id)}")
     except ApiException as exc:
         if exc.status != 409:  # 409 = AlreadyExists

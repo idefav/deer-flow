@@ -40,6 +40,10 @@ dev = [
 markers = [
     "no_auto_user: disable the conftest autouse contextvar fixture for this test",
     "allow_blocking_io: opt out of the strict Blockbuster gate in tests/blocking_io/",
+    "live: tests that require explicit operator opt-in or real external services",
+    "docker_live: live tests that require a local Docker daemon",
+    "remote_live: live tests that require a remote service or cluster",
+    "requires_llm: live tests that require configured model credentials",
 ]
 
 [tool.uv]

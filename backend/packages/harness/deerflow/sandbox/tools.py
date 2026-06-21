@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import posixpath
 import re
@@ -6,12 +7,15 @@ import shlex
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Any
 
 from langchain.tools import tool
 
 from deerflow.agents.thread_state import ThreadDataState
 from deerflow.config import get_app_config
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.sandbox.exceptions import (
     SandboxError,
     SandboxNotFoundError,
@@ -31,6 +35,8 @@ from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
 from deerflow.sandbox.security import LOCAL_HOST_BASH_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.tools.types import Runtime
+
+logger = logging.getLogger(__name__)
 
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![:\w])(?<!:/)/(?:[^\s\"'`;&|<>()]+)")
 # A ``{...}`` block holding a single identifier-like placeholder (e.g. ``{id}``
@@ -1137,6 +1143,130 @@ def is_local_sandbox(runtime: Runtime | None) -> bool:
     return sandbox_id == "local" or sandbox_id.startswith("local:")
 
 
+def _runtime_context(runtime: Runtime | None) -> dict[str, Any]:
+    context = getattr(runtime, "context", None)
+    return context if isinstance(context, dict) else {}
+
+
+def _runtime_config(runtime: Runtime | None) -> dict[str, Any]:
+    config = getattr(runtime, "config", None)
+    return config if isinstance(config, dict) else {}
+
+
+def _normalise_skill_names(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        names = [item.strip() for item in value.split(",") if item.strip()]
+        return names
+    if isinstance(value, (list, tuple, set, frozenset)):
+        names = [str(item) for item in value if item is not None and str(item)]
+        return sorted(names) if isinstance(value, (set, frozenset)) else names
+    return None
+
+
+def _runtime_dict_candidates(runtime: Runtime | None) -> list[dict[str, Any]]:
+    config = _runtime_config(runtime)
+    candidates = [_runtime_context(runtime)]
+    for key in ("configurable", "metadata"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    return candidates
+
+
+def _resolve_runtime_agent_name(runtime: Runtime | None) -> str | None:
+    for source in _runtime_dict_candidates(runtime):
+        value = source.get("agent_name")
+        if value is None:
+            continue
+        agent_name = str(value)
+        if agent_name and agent_name != "default":
+            return agent_name
+    return None
+
+
+def _resolve_runtime_skill_names(runtime: Runtime | None) -> list[str] | None:
+    for source in _runtime_dict_candidates(runtime):
+        for key in ("available_skills", "skill_names", "active_skills", "skills"):
+            if key not in source:
+                continue
+            return _normalise_skill_names(source.get(key))
+    return None
+
+
+def _new_runtime_context_manifest_builder():
+    from deerflow.agents.memory.storage import get_memory_storage
+    from deerflow.config.agent_store import DbAgentStore
+    from deerflow.sandbox.materializer import SandboxRuntimeContextManifestBuilder
+    from deerflow.skills.storage import get_or_new_skill_storage
+
+    return SandboxRuntimeContextManifestBuilder(
+        memory_storage=get_memory_storage(),
+        agent_store=DbAgentStore(),
+        skill_storage=get_or_new_skill_storage(),
+    )
+
+
+def _runtime_context_materialized_for(runtime: Runtime | None, sandbox_id: str) -> bool:
+    context = _runtime_context(runtime)
+    return context.get("sandbox_context_sandbox_id") == sandbox_id
+
+
+def _should_materialize_runtime_context(runtime: Runtime | None, sandbox_id: str) -> bool:
+    if _runtime_context_materialized_for(runtime, sandbox_id):
+        return False
+    return is_db_config_enabled()
+
+
+def _is_runtime_context_fail_closed() -> bool:
+    try:
+        return bool(get_app_config().sandbox.runtime_context_fail_closed)
+    except Exception:
+        return False
+
+
+def _runtime_context_skills_root() -> str:
+    try:
+        return get_app_config().skills.container_path or _DEFAULT_SKILLS_CONTAINER_PATH
+    except Exception:
+        return _DEFAULT_SKILLS_CONTAINER_PATH
+
+
+def _materialize_runtime_context_from_db(runtime: Runtime | None, sandbox: Sandbox, sandbox_id: str) -> None:
+    if not _should_materialize_runtime_context(runtime, sandbox_id):
+        return
+
+    context = _runtime_context(runtime)
+    try:
+        from deerflow.sandbox.materializer import SandboxMaterializer
+
+        manifest = _new_runtime_context_manifest_builder().build(
+            user_id=resolve_runtime_user_id(runtime),
+            agent_name=_resolve_runtime_agent_name(runtime),
+            skill_names=_resolve_runtime_skill_names(runtime),
+        )
+        result = SandboxMaterializer(skills_root=_runtime_context_skills_root()).materialize(sandbox, manifest)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        context["sandbox_context_error"] = error
+        logger.exception("Failed to materialize DB runtime context into sandbox %s", sandbox_id)
+        if _is_runtime_context_fail_closed():
+            raise SandboxRuntimeError(f"Failed to materialize DB runtime context: {error}") from exc
+        return
+
+    context["sandbox_context_sandbox_id"] = sandbox_id
+    context["sandbox_context_manifest_hash"] = result.manifest_hash
+    context["sandbox_context_changed"] = result.changed
+    context["sandbox_context_files"] = result.files_written
+
+
+async def _materialize_runtime_context_from_db_async(runtime: Runtime | None, sandbox: Sandbox, sandbox_id: str) -> None:
+    if not _should_materialize_runtime_context(runtime, sandbox_id):
+        return
+    await asyncio.to_thread(_materialize_runtime_context_from_db, runtime, sandbox, sandbox_id)
+
+
 def sandbox_from_runtime(runtime: Runtime | None = None) -> Sandbox:
     """Extract sandbox instance from tool runtime.
 
@@ -1199,6 +1329,7 @@ def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
             if sandbox is not None:
                 if runtime.context is not None:
                     runtime.context["sandbox_id"] = sandbox_id  # Ensure sandbox_id is in context for releasing in after_agent
+                _materialize_runtime_context_from_db(runtime, sandbox, sandbox_id)
                 return sandbox
             # Sandbox was released, fall through to acquire new one
 
@@ -1222,6 +1353,7 @@ def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
 
     if runtime.context is not None:
         runtime.context["sandbox_id"] = sandbox_id  # Ensure sandbox_id is in context for releasing in after_agent
+    _materialize_runtime_context_from_db(runtime, sandbox, sandbox_id)
     return sandbox
 
 
@@ -1246,6 +1378,7 @@ async def ensure_sandbox_initialized_async(runtime: Runtime | None = None) -> Sa
             if sandbox is not None:
                 if runtime.context is not None:
                     runtime.context["sandbox_id"] = sandbox_id
+                await _materialize_runtime_context_from_db_async(runtime, sandbox, sandbox_id)
                 return sandbox
 
     thread_id = runtime.context.get("thread_id") if runtime.context else None
@@ -1265,6 +1398,7 @@ async def ensure_sandbox_initialized_async(runtime: Runtime | None = None) -> Sa
 
     if runtime.context is not None:
         runtime.context["sandbox_id"] = sandbox_id
+    await _materialize_runtime_context_from_db_async(runtime, sandbox, sandbox_id)
     return sandbox
 
 

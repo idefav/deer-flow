@@ -1,4 +1,5 @@
 import importlib
+import shutil
 from types import SimpleNamespace
 
 import anyio
@@ -176,3 +177,34 @@ def test_skill_manage_rejects_support_path_traversal(monkeypatch, tmp_path):
             "malicious overwrite",
             "references/../SKILL.md",
         )
+
+
+def test_skill_manage_remove_file_deletes_db_backing_record(monkeypatch, tmp_path):
+    from deerflow.config.database_config import DatabaseConfig
+    from deerflow.skills.storage.db_skill_storage import DbSkillStorage
+
+    cache_root = tmp_path / "skills-cache"
+    storage = DbSkillStorage(
+        host_path=str(cache_root),
+        database_config=DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db")),
+    )
+    storage.write_custom_skill("db-skill", "SKILL.md", _skill_content("db-skill"))
+    storage.write_custom_skill("db-skill", "references/notes.md", "supporting notes")
+    monkeypatch.setattr(skill_manage_module, "get_or_new_skill_storage", lambda: storage)
+
+    runtime = SimpleNamespace(context={"thread_id": "thread-1"}, config={"configurable": {"thread_id": "thread-1"}})
+    result = anyio.run(
+        skill_manage_module.skill_manage_tool.coroutine,
+        runtime,
+        "remove_file",
+        "db-skill",
+        None,
+        "references/notes.md",
+    )
+
+    assert "Removed 'references/notes.md'" in result
+    assert storage.read_history("db-skill")[-1]["prev_content"] == "supporting notes"
+    shutil.rmtree(cache_root / "custom")
+    skill_dir = storage.get_custom_skill_dir("db-skill")
+    assert (skill_dir / "SKILL.md").exists()
+    assert not (skill_dir / "references" / "notes.md").exists()

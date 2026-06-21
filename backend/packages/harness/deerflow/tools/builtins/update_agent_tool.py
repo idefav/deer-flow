@@ -25,8 +25,9 @@ from langchain_core.tools import tool
 from langgraph.types import Command
 from pydantic import BeforeValidator
 
-from deerflow.config.agents_config import load_agent_config, validate_agent_name
+from deerflow.config.agents_config import AgentConfig, load_agent_config, load_agent_soul, save_agent_config, validate_agent_name
 from deerflow.config.app_config import get_app_config
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import get_paths
 from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.tools.types import Runtime
@@ -148,6 +149,69 @@ def update_agent(
     # and the user sees confusing repeated warnings on every later turn.
     if model is not None and get_app_config().get_model_config(model) is None:
         return _err(f"Unknown model '{model}'. Pass a model name that exists in config.yaml's models section.")
+
+    if is_db_config_enabled():
+        try:
+            existing_cfg = load_agent_config(agent_name, user_id=user_id)
+        except FileNotFoundError:
+            return _err(f"Agent '{agent_name}' does not exist for the current user. Use setup_agent to create a new agent first.")
+        except ValueError as e:
+            return _err(f"Agent '{agent_name}' has an unreadable config: {e}")
+
+        if existing_cfg is None:
+            return _err(f"Agent '{agent_name}' could not be loaded.")
+
+        updated_fields: list[str] = []
+        config_data: dict[str, Any] = {"name": agent_name}
+
+        new_description = description if description is not None else existing_cfg.description
+        config_data["description"] = new_description
+        if description is not None and description != existing_cfg.description:
+            updated_fields.append("description")
+
+        new_model = model if model is not None else existing_cfg.model
+        if new_model is not None:
+            config_data["model"] = new_model
+        if model is not None and model != existing_cfg.model:
+            updated_fields.append("model")
+
+        new_tool_groups = tool_groups if tool_groups is not None else existing_cfg.tool_groups
+        if new_tool_groups is not None:
+            config_data["tool_groups"] = new_tool_groups
+        if tool_groups is not None and tool_groups != existing_cfg.tool_groups:
+            updated_fields.append("tool_groups")
+
+        new_skills = skills if skills is not None else existing_cfg.skills
+        if new_skills is not None:
+            config_data["skills"] = new_skills
+        if skills is not None and skills != existing_cfg.skills:
+            updated_fields.append("skills")
+
+        next_soul = load_agent_soul(agent_name, user_id=user_id) or ""
+        if soul is not None:
+            next_soul = soul
+            updated_fields.append("soul")
+
+        if not updated_fields:
+            return Command(update={"messages": [ToolMessage(content=f"No changes applied to agent '{agent_name}'. The provided values matched the existing config.", tool_call_id=tool_call_id)]})
+
+        try:
+            save_agent_config(agent_name, AgentConfig.model_validate(config_data), next_soul, user_id=user_id)
+        except Exception as e:
+            logger.error("[update_agent] Failed to update DB-backed agent '%s' (user=%s): %s", agent_name, user_id, e, exc_info=True)
+            return _err(f"Failed to update agent '{agent_name}': {e}")
+
+        logger.info("[update_agent] Updated DB-backed agent '%s' (user=%s) fields: %s", agent_name, user_id, updated_fields)
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=(f"Agent '{agent_name}' updated successfully. Changed: {', '.join(updated_fields)}. The new configuration takes effect on the next user turn."),
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
 
     paths = get_paths()
     agent_dir = paths.user_agent_dir(user_id, agent_name)

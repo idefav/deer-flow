@@ -134,14 +134,25 @@ class RemoteSandboxBackend(SandboxBackend):
 
     def _provisioner_create(self, thread_id: str | None, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
         """POST /api/sandboxes → create Pod + Service."""
+        payload = {
+            "sandbox_id": sandbox_id,
+            "thread_id": thread_id or sandbox_id,
+            "user_id": get_effective_user_id(),
+        }
+        if extra_mounts:
+            payload["extra_mounts"] = [
+                {
+                    "host_path": host_path,
+                    "container_path": container_path,
+                    "read_only": read_only,
+                }
+                for host_path, container_path, read_only in extra_mounts
+            ]
+
         try:
             resp = requests.post(
                 f"{self._provisioner_url}/api/sandboxes",
-                json={
-                    "sandbox_id": sandbox_id,
-                    "thread_id": thread_id,
-                    "user_id": get_effective_user_id(),
-                },
+                json=payload,
                 timeout=30,
             )
             resp.raise_for_status()
@@ -152,8 +163,13 @@ class RemoteSandboxBackend(SandboxBackend):
                 sandbox_url=data["sandbox_url"],
             )
         except requests.RequestException as exc:
-            logger.error(f"Provisioner create failed for {sandbox_id}: {exc}")
-            raise RuntimeError(f"Provisioner create failed: {exc}") from exc
+            detail = str(exc)
+            response = getattr(exc, "response", None)
+            response_text = getattr(response, "text", "")
+            if response_text:
+                detail = f"{detail}; response={response_text}"
+            logger.error(f"Provisioner create failed for {sandbox_id}: {detail}")
+            raise RuntimeError(f"Provisioner create failed: {detail}") from exc
 
     def _provisioner_destroy(self, sandbox_id: str) -> None:
         """DELETE /api/sandboxes/{sandbox_id} → destroy Pod + Service."""

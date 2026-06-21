@@ -12,20 +12,39 @@ _mcp_tools_cache: list[BaseTool] | None = None
 _cache_initialized = False
 _initialization_lock = asyncio.Lock()
 _config_mtime: float | None = None  # Track config file modification time
+_config_revision: int | None = None  # Track DB-backed extensions config revision
 
 
 def _get_config_mtime() -> float | None:
     """Get the modification time of the extensions config file.
 
+    DB-backed extensions config uses revisions instead of local file mtimes, so
+    DB mode deliberately skips file path resolution.
+
     Returns:
         The modification time as a float, or None if the file doesn't exist.
     """
+    from deerflow.config.bootstrap import is_db_config_enabled
     from deerflow.config.extensions_config import ExtensionsConfig
+
+    if is_db_config_enabled():
+        return None
 
     config_path = ExtensionsConfig.resolve_config_path()
     if config_path and config_path.exists():
         return os.path.getmtime(config_path)
     return None
+
+
+def _get_config_revision() -> int | None:
+    """Get the active DB extensions config revision, when DB mode is enabled."""
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    if not is_db_config_enabled():
+        return None
+    from deerflow.config.extensions_config import get_extensions_config_revision
+
+    return get_extensions_config_revision()
 
 
 def _is_cache_stale() -> bool:
@@ -34,10 +53,15 @@ def _is_cache_stale() -> bool:
     Returns:
         True if the cache should be invalidated, False otherwise.
     """
-    global _config_mtime
+    global _config_mtime, _config_revision
 
     if not _cache_initialized:
         return False  # Not initialized yet, not stale
+
+    current_revision = _get_config_revision()
+    if _config_revision is not None and current_revision is not None and current_revision != _config_revision:
+        logger.info("MCP extensions config revision has changed (%s -> %s), cache is stale", _config_revision, current_revision)
+        return True
 
     current_mtime = _get_config_mtime()
 
@@ -61,7 +85,7 @@ async def initialize_mcp_tools() -> list[BaseTool]:
     Returns:
         List of LangChain tools from all enabled MCP servers.
     """
-    global _mcp_tools_cache, _cache_initialized, _config_mtime
+    global _mcp_tools_cache, _cache_initialized, _config_mtime, _config_revision
 
     async with _initialization_lock:
         if _cache_initialized:
@@ -74,7 +98,13 @@ async def initialize_mcp_tools() -> list[BaseTool]:
         _mcp_tools_cache = await get_mcp_tools()
         _cache_initialized = True
         _config_mtime = _get_config_mtime()  # Record config file mtime
-        logger.info(f"MCP tools initialized: {len(_mcp_tools_cache)} tool(s) loaded (config mtime: {_config_mtime})")
+        _config_revision = _get_config_revision()
+        logger.info(
+            "MCP tools initialized: %d tool(s) loaded (config mtime: %s, revision: %s)",
+            len(_mcp_tools_cache),
+            _config_mtime,
+            _config_revision,
+        )
 
         return _mcp_tools_cache
 
@@ -102,29 +132,25 @@ def get_cached_mcp_tools() -> list[BaseTool]:
     if not _cache_initialized:
         logger.info("MCP tools not initialized, performing lazy initialization...")
         try:
-            # Try to initialize in the current event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If loop is already running (e.g., in LangGraph Studio),
-                # we need to create a new loop in a thread
-                import concurrent.futures
-
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, initialize_mcp_tools())
-                    future.result()
-            else:
-                # If no loop is running, we can use the current loop
-                loop.run_until_complete(initialize_mcp_tools())
+            asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop exists, create one
             try:
                 asyncio.run(initialize_mcp_tools())
             except Exception:
                 logger.exception("Failed to lazy-initialize MCP tools")
                 return []
-        except Exception:
-            logger.exception("Failed to lazy-initialize MCP tools")
-            return []
+        else:
+            # If a loop is already running (e.g. LangGraph Studio), initialize
+            # in a separate thread with its own event loop.
+            try:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, initialize_mcp_tools())
+                    future.result()
+            except Exception:
+                logger.exception("Failed to lazy-initialize MCP tools")
+                return []
 
     return _mcp_tools_cache or []
 
@@ -136,10 +162,11 @@ def reset_mcp_tools_cache() -> None:
     Also closes all persistent MCP sessions so they are recreated on
     the next tool load.
     """
-    global _mcp_tools_cache, _cache_initialized, _config_mtime
+    global _mcp_tools_cache, _cache_initialized, _config_mtime, _config_revision
     _mcp_tools_cache = None
     _cache_initialized = False
     _config_mtime = None
+    _config_revision = None
 
     # Close persistent sessions – they will be recreated by the next
     # get_mcp_tools() call with the (possibly updated) connection config.

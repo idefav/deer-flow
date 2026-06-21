@@ -14,6 +14,7 @@ def _set_skills_cache_state(*, skills=None, active=False, version=0):
     prompt_module._get_cached_skills_prompt_section.cache_clear()
     with prompt_module._enabled_skills_lock:
         prompt_module._enabled_skills_cache = skills
+        prompt_module._enabled_skills_extensions_revision = None
         prompt_module._enabled_skills_by_config_cache.clear()
         prompt_module._enabled_skills_refresh_active = active
         prompt_module._enabled_skills_refresh_version = version
@@ -255,6 +256,101 @@ def test_refresh_skills_system_prompt_cache_async_reloads_immediately(monkeypatc
 
         assert [skill.name for skill in prompt_module._get_enabled_skills()] == ["second-skill"]
     finally:
+        _set_skills_cache_state()
+
+
+def test_enabled_skills_cache_refreshes_when_extensions_revision_changes(monkeypatch, tmp_path):
+    def make_skill(name: str) -> Skill:
+        skill_dir = tmp_path / name
+        return Skill(
+            name=name,
+            description=f"Description for {name}",
+            license="MIT",
+            skill_dir=skill_dir,
+            skill_file=skill_dir / "SKILL.md",
+            relative_path=skill_dir.relative_to(tmp_path),
+            category=SkillCategory.CUSTOM,
+            enabled=True,
+        )
+
+    state = {"skills": [make_skill("first-skill")], "revision": 1}
+    monkeypatch.setattr(prompt_module, "get_extensions_config_revision", lambda: state["revision"], raising=False)
+    monkeypatch.setattr(prompt_module, "get_or_new_skill_storage", lambda **kwargs: SimpleNamespace(load_skills=lambda *, enabled_only: list(state["skills"])))
+    _set_skills_cache_state()
+
+    try:
+        prompt_module.warm_enabled_skills_cache()
+        assert [skill.name for skill in prompt_module._get_enabled_skills()] == ["first-skill"]
+
+        state["skills"] = [make_skill("second-skill")]
+        state["revision"] = 2
+        prompt_module.warm_enabled_skills_cache()
+
+        assert [skill.name for skill in prompt_module._get_enabled_skills()] == ["second-skill"]
+    finally:
+        _set_skills_cache_state()
+
+
+def test_skills_prompt_section_drops_stale_db_enabled_skill_after_revision_change(monkeypatch, tmp_path):
+    from deerflow.config.app_config import reset_app_config, set_app_config
+    from deerflow.config.database_config import DatabaseConfig
+    from deerflow.config.extensions_config import ExtensionsConfig, reset_extensions_config
+    from deerflow.config.extensions_sources import DbExtensionsConfigStore
+    from deerflow.config.skills_config import SkillsConfig
+    from deerflow.skills.storage import reset_skill_storage
+    from deerflow.skills.storage.db_skill_storage import DbSkillStorage
+
+    database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    skills_root = tmp_path / "skills-cache"
+    app_config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": database.model_dump(),
+            "skills": SkillsConfig(path=str(skills_root)).model_dump(),
+        }
+    )
+    store = DbExtensionsConfigStore(database_config=database)
+    store.save_extensions_config(
+        ExtensionsConfig.model_validate(
+            {
+                "mcpServers": {},
+                "skills": {"db-skill": {"enabled": True}},
+            }
+        )
+    )
+    skill_storage = DbSkillStorage(host_path=str(skills_root), database_config=database)
+    skill_storage.write_custom_skill(
+        "db-skill",
+        "SKILL.md",
+        "---\nname: db-skill\ndescription: DB controlled skill\n---\n\nUse the DB-backed skill.\n",
+    )
+
+    set_app_config(app_config)
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    reset_extensions_config()
+    reset_skill_storage()
+    _set_skills_cache_state()
+
+    try:
+        prompt_module.warm_enabled_skills_cache()
+        assert "db-skill" in prompt_module.get_skills_prompt_section()
+
+        current = store.load_extensions_config()
+        store.save_extensions_config(
+            ExtensionsConfig.model_validate(
+                {
+                    "mcpServers": {},
+                    "skills": {"db-skill": {"enabled": False}},
+                }
+            ),
+            expected_revision=current.revision,
+        )
+
+        assert "db-skill" not in prompt_module.get_skills_prompt_section()
+    finally:
+        reset_app_config()
+        reset_extensions_config()
+        reset_skill_storage()
         _set_skills_cache_state()
 
 

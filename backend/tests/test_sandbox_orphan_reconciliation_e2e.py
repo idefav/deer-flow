@@ -19,6 +19,8 @@ import time
 
 import pytest
 
+pytestmark = [pytest.mark.live, pytest.mark.docker_live]
+
 
 def _docker_available() -> bool:
     try:

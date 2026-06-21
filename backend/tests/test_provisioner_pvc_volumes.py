@@ -1,5 +1,6 @@
 """Regression tests for provisioner PVC volume support."""
 
+import pytest
 
 # ── _build_volumes ─────────────────────────────────────────────────────
 
@@ -78,6 +79,22 @@ class TestBuildVolumes:
         assert volumes[0].name == "skills"
         assert volumes[1].name == "user-data"
 
+    def test_extra_mount_replaces_default_skills_volume(self, provisioner_module):
+        """Writable DB-mode /mnt/skills mount should override the default read-only skills volume."""
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ]
+
+        volumes = provisioner_module._build_volumes("thread-1", extra_mounts=extra_mounts)
+
+        assert [volume.name for volume in volumes] == ["user-data", "extra-mount-0"]
+        assert volumes[1].host_path.path == "/host/thread/skills"
+        assert volumes[1].host_path.type == "DirectoryOrCreate"
+
 
 # ── _build_volume_mounts ───────────────────────────────────────────────
 
@@ -132,6 +149,22 @@ class TestBuildVolumeMounts:
         """Should always return exactly two mounts."""
         assert len(provisioner_module._build_volume_mounts("t")) == 2
 
+    def test_extra_mount_replaces_default_skills_mount(self, provisioner_module):
+        """Writable DB-mode /mnt/skills mount should replace the default read-only skills mount."""
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ]
+
+        mounts = provisioner_module._build_volume_mounts("thread-1", extra_mounts=extra_mounts)
+
+        assert [mount.mount_path for mount in mounts] == ["/mnt/user-data", "/mnt/skills"]
+        assert mounts[1].name == "extra-mount-0"
+        assert mounts[1].read_only is False
+
 
 # ── _build_pod integration ─────────────────────────────────────────────
 
@@ -162,3 +195,192 @@ class TestBuildPodVolumes:
         assert pod.spec.volumes[1].persistent_volume_claim is not None
         userdata_mount = pod.spec.containers[0].volume_mounts[1]
         assert userdata_mount.sub_path == "deer-flow/users/user-7/threads/thread-1/user-data"
+
+    def test_pod_wires_extra_mounts(self, provisioner_module):
+        """Pod should mount provisioner extra_mounts with the requested permissions."""
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ]
+
+        pod = provisioner_module._build_pod("sandbox-1", "thread-1", extra_mounts=extra_mounts)
+
+        assert [volume.name for volume in pod.spec.volumes] == ["user-data", "extra-mount-0"]
+        assert [mount.mount_path for mount in pod.spec.containers[0].volume_mounts] == ["/mnt/user-data", "/mnt/skills"]
+        assert pod.spec.containers[0].volume_mounts[1].read_only is False
+
+    def test_pod_records_mount_contract_hash(self, provisioner_module):
+        """Pod annotations should record the mount contract used for idempotent reuse."""
+        extra_mounts = [
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ]
+
+        pod = provisioner_module._build_pod("sandbox-1", "thread-1", extra_mounts=extra_mounts)
+
+        annotations = pod.metadata.annotations
+        assert annotations[provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION] == provisioner_module._mount_contract_hash(extra_mounts)
+        assert annotations[provisioner_module.MOUNT_CONTRACT_PATHS_ANNOTATION] == "/mnt/skills"
+
+
+# ── create_sandbox integration ─────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_passes_extra_mounts_to_pod_builder(monkeypatch, provisioner_module):
+    """POST model should pass extra_mounts through to Pod construction."""
+    captured: dict[str, object] = {}
+    node_port_calls = {"count": 0}
+
+    class FakeCoreV1:
+        def create_namespaced_pod(self, namespace, pod):
+            captured["pod_namespace"] = namespace
+            captured["pod"] = pod
+
+        def create_namespaced_service(self, namespace, service):
+            captured["service_namespace"] = namespace
+            captured["service"] = service
+
+    def fake_get_node_port(_sandbox_id):
+        node_port_calls["count"] += 1
+        return None if node_port_calls["count"] == 1 else 31001
+
+    def fake_build_pod(sandbox_id, thread_id, user_id=provisioner_module.DEFAULT_USER_ID, extra_mounts=None):
+        captured["build_pod_args"] = (sandbox_id, thread_id, user_id, extra_mounts)
+        return "pod"
+
+    monkeypatch.setattr(provisioner_module, "core_v1", FakeCoreV1())
+    monkeypatch.setattr(provisioner_module, "_get_node_port", fake_get_node_port)
+    monkeypatch.setattr(provisioner_module, "_get_pod_phase", lambda _sandbox_id: "Running")
+    monkeypatch.setattr(provisioner_module, "_build_pod", fake_build_pod)
+    monkeypatch.setattr(provisioner_module, "_build_service", lambda _sandbox_id: "service")
+
+    req = provisioner_module.CreateSandboxRequest(
+        sandbox_id="sandbox-1",
+        thread_id="thread-1",
+        user_id="user-7",
+        extra_mounts=[
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ],
+    )
+
+    response = await provisioner_module.create_sandbox(req)
+
+    sandbox_id, thread_id, user_id, extra_mounts = captured["build_pod_args"]
+    assert (sandbox_id, thread_id, user_id) == ("sandbox-1", "thread-1", "user-7")
+    assert extra_mounts == req.extra_mounts
+    assert captured["pod"] == "pod"
+    assert captured["service"] == "service"
+    assert response.sandbox_url.endswith(":31001")
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_rejects_existing_pod_with_mismatched_mount_contract(monkeypatch, provisioner_module):
+    """Existing Pods must not be reused when their mount contract is incompatible."""
+
+    class FakeCoreV1:
+        def read_namespaced_pod(self, name, namespace):
+            return type(
+                "Pod",
+                (),
+                {
+                    "metadata": type(
+                        "Metadata",
+                        (),
+                        {
+                            "name": name,
+                            "namespace": namespace,
+                            "annotations": {
+                                provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION: "old-contract",
+                            },
+                        },
+                    )(),
+                },
+            )()
+
+    monkeypatch.setattr(provisioner_module, "core_v1", FakeCoreV1())
+    monkeypatch.setattr(provisioner_module, "_get_node_port", lambda _sandbox_id: 31001)
+    monkeypatch.setattr(provisioner_module, "_get_pod_phase", lambda _sandbox_id: "Running")
+
+    req = provisioner_module.CreateSandboxRequest(
+        sandbox_id="sandbox-1",
+        thread_id="thread-1",
+        extra_mounts=[
+            provisioner_module.ExtraMount(
+                host_path="/host/thread/skills",
+                container_path="/mnt/skills",
+                read_only=False,
+            )
+        ],
+    )
+
+    with pytest.raises(provisioner_module.HTTPException) as exc_info:
+        await provisioner_module.create_sandbox(req)
+
+    assert exc_info.value.status_code == 409
+    assert "mount contract" in exc_info.value.detail
+
+
+@pytest.mark.anyio
+async def test_create_sandbox_reuses_existing_pod_with_matching_mount_contract(monkeypatch, provisioner_module):
+    """Existing Pods remain idempotent when their mount contract matches the request."""
+    extra_mounts = [
+        provisioner_module.ExtraMount(
+            host_path="/host/thread/skills",
+            container_path="/mnt/skills",
+            read_only=False,
+        )
+    ]
+
+    class FakeCoreV1:
+        def read_namespaced_pod(self, name, namespace):
+            return type(
+                "Pod",
+                (),
+                {
+                    "metadata": type(
+                        "Metadata",
+                        (),
+                        {
+                            "name": name,
+                            "namespace": namespace,
+                            "annotations": {
+                                provisioner_module.MOUNT_CONTRACT_HASH_ANNOTATION: provisioner_module._mount_contract_hash(
+                                    extra_mounts
+                                ),
+                            },
+                        },
+                    )(),
+                },
+            )()
+
+        def create_namespaced_pod(self, namespace, pod):
+            raise AssertionError("matching existing sandbox should not create a new Pod")
+
+        def create_namespaced_service(self, namespace, service):
+            raise AssertionError("matching existing sandbox should not create a new Service")
+
+    monkeypatch.setattr(provisioner_module, "core_v1", FakeCoreV1())
+    monkeypatch.setattr(provisioner_module, "_get_node_port", lambda _sandbox_id: 31001)
+    monkeypatch.setattr(provisioner_module, "_get_pod_phase", lambda _sandbox_id: "Running")
+
+    response = await provisioner_module.create_sandbox(
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-1",
+            thread_id="thread-1",
+            extra_mounts=extra_mounts,
+        )
+    )
+
+    assert response.sandbox_url.endswith(":31001")
+    assert response.status == "Running"

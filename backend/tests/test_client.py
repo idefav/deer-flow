@@ -1228,6 +1228,56 @@ class TestMcpConfig:
         finally:
             tmp_path.unlink()
 
+    def test_update_mcp_config_db_mode_writes_runtime_config(self, monkeypatch, tmp_path):
+        from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+        from deerflow.config.database_config import DatabaseConfig
+        from deerflow.config.extensions_config import ExtensionsConfig, reset_extensions_config
+        from deerflow.config.extensions_sources import DbExtensionsConfigStore
+
+        database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+        app_config = AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+        set_app_config(app_config)
+        monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+        store = DbExtensionsConfigStore(database_config=database)
+        store.save_extensions_config(
+            ExtensionsConfig.model_validate(
+                {
+                    "mcpServers": {"github": {"type": "stdio", "command": "npx"}},
+                    "skills": {"writer": {"enabled": False}},
+                    "mcpInterceptors": ["pkg.module:build"],
+                }
+            )
+        )
+        reset_extensions_config()
+
+        def fail_file_resolution():
+            raise AssertionError("DB mode must not resolve an extensions_config.json path")
+
+        client = DeerFlowClient()
+        client._agent = MagicMock()
+        client._agent_config_key = ("stale",)
+        monkeypatch.setattr("deerflow.client.ExtensionsConfig.resolve_config_path", staticmethod(fail_file_resolution))
+
+        try:
+            result = client.update_mcp_config({"github": {"enabled": False, "type": "stdio", "command": "npx"}})
+        finally:
+            reset_app_config()
+            reset_extensions_config()
+
+        assert result["mcp_servers"]["github"]["enabled"] is False
+        assert client._agent is None
+        assert client._agent_config_key is None
+
+        stored = store.load_extensions_config().config
+        assert stored.mcp_servers["github"].enabled is False
+        assert stored.skills["writer"].enabled is False
+        assert stored.model_extra["mcpInterceptors"] == ["pkg.module:build"]
+
 
 # ---------------------------------------------------------------------------
 # Skills management
@@ -1283,6 +1333,62 @@ class TestSkillsManagement:
             assert client._agent is None  # M2: agent invalidated
         finally:
             tmp_path.unlink()
+
+    def test_update_skill_db_mode_writes_runtime_config(self, monkeypatch, tmp_path):
+        from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+        from deerflow.config.database_config import DatabaseConfig
+        from deerflow.config.extensions_config import ExtensionsConfig, reset_extensions_config
+        from deerflow.config.extensions_sources import DbExtensionsConfigStore
+
+        database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+        app_config = AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+        set_app_config(app_config)
+        monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+        store = DbExtensionsConfigStore(database_config=database)
+        store.save_extensions_config(
+            ExtensionsConfig.model_validate(
+                {
+                    "mcpServers": {"github": {"type": "stdio", "command": "npx"}},
+                    "skills": {},
+                    "mcpInterceptors": ["pkg.module:build"],
+                }
+            )
+        )
+        reset_extensions_config()
+
+        skill = self._make_skill("writer", enabled=True)
+        updated_skill = self._make_skill("writer", enabled=False)
+
+        def fail_file_resolution():
+            raise AssertionError("DB mode must not resolve an extensions_config.json path")
+
+        client = DeerFlowClient()
+        client._agent = MagicMock()
+        client._agent_config_key = ("stale",)
+        storage = MagicMock()
+        storage.load_skills.side_effect = [[skill], [updated_skill]]
+        monkeypatch.setattr("deerflow.skills.storage.get_or_new_skill_storage", lambda: storage)
+        monkeypatch.setattr("deerflow.client.ExtensionsConfig.resolve_config_path", staticmethod(fail_file_resolution))
+
+        try:
+            result = client.update_skill("writer", enabled=False)
+        finally:
+            reset_app_config()
+            reset_extensions_config()
+
+        assert result["enabled"] is False
+        assert client._agent is None
+        assert client._agent_config_key is None
+
+        stored = store.load_extensions_config().config
+        assert stored.skills["writer"].enabled is False
+        assert "github" in stored.mcp_servers
+        assert stored.model_extra["mcpInterceptors"] == ["pkg.module:build"]
 
     def test_update_skill_not_found(self, client):
         with patch("deerflow.skills.storage.local_skill_storage.LocalSkillStorage.load_skills", return_value=[]):

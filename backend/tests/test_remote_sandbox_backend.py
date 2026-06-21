@@ -14,16 +14,17 @@ class _StubResponse:
         status_code: int = 200,
         payload: object | None = None,
         json_exc: Exception | None = None,
+        text: str = "",
     ):
         self.status_code = status_code
         self._payload = {} if payload is None else payload
         self._json_exc = json_exc
         self.ok = 200 <= status_code < 400
-        self.text = ""
+        self.text = text
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def json(self) -> object:
         if self._json_exc is not None:
@@ -166,7 +167,7 @@ def test_provisioner_create_accepts_anonymous_thread_id(monkeypatch):
         assert url == "http://provisioner:8002/api/sandboxes"
         assert json == {
             "sandbox_id": "anon123",
-            "thread_id": None,
+            "thread_id": "anon123",
             "user_id": "test-user-autouse",
         }
         assert timeout == 30
@@ -189,6 +190,26 @@ def test_provisioner_create_raises_runtime_error_on_request_exception(monkeypatc
 
     with pytest.raises(RuntimeError, match="Provisioner create failed"):
         backend._provisioner_create("thread-1", "abc123")
+
+
+def test_provisioner_create_includes_response_body_in_runtime_error(monkeypatch):
+    backend = RemoteSandboxBackend("http://provisioner:8002")
+
+    def mock_post(url: str, json: dict, timeout: int):
+        return _StubResponse(
+            status_code=409,
+            text='{"detail":"Existing sandbox has a different mount contract; destroy it before retrying."}',
+        )
+
+    monkeypatch.setattr(requests, "post", mock_post)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        backend._provisioner_create("thread-1", "abc123", extra_mounts=[("/host/skills", "/mnt/skills", False)])
+
+    message = str(exc_info.value)
+    assert "Provisioner create failed" in message
+    assert "different mount contract" in message
+    assert "destroy it before retrying" in message
 
 
 def test_destroy_delegates_to_provisioner_destroy(monkeypatch):

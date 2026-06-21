@@ -8,7 +8,9 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.gateway.deps import require_admin_user
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.extensions_config import ExtensionsConfig, get_extensions_config, reload_extensions_config
+from deerflow.config.extensions_sources import DbExtensionsConfigStore, ExtensionsConfigConflictError
 from deerflow.mcp.cache import reset_mcp_tools_cache
 
 logger = logging.getLogger(__name__)
@@ -224,6 +226,12 @@ def _merge_preserving_secrets(
     )
 
 
+def _updated_by(request: Request) -> str | None:
+    user = getattr(request.state, "user", None)
+    user_id = getattr(user, "id", None)
+    return str(user_id) if user_id is not None else None
+
+
 @router.get(
     "/mcp/config",
     response_model=McpConfigResponse,
@@ -284,13 +292,13 @@ async def reset_mcp_tools_cache_endpoint(request: Request) -> McpCacheResetRespo
     "/mcp/config",
     response_model=McpConfigResponse,
     summary="Update MCP Configuration",
-    description="Update Model Context Protocol (MCP) server configurations and save to file.",
+    description="Update Model Context Protocol (MCP) server configurations in the active extensions configuration source.",
 )
 async def update_mcp_configuration(request: Request, body: McpConfigUpdateRequest) -> McpConfigResponse:
     """Update the MCP configuration.
 
     This will:
-    1. Save the new configuration to the mcp_config.json file
+    1. Save the new configuration to the active extensions configuration source
     2. Reload the configuration cache
     3. Reset MCP tools cache to trigger reinitialization
 
@@ -301,7 +309,7 @@ async def update_mcp_configuration(request: Request, body: McpConfigUpdateReques
         The updated MCP configuration.
 
     Raises:
-        HTTPException: 500 if the configuration file cannot be written.
+        HTTPException: 500 if the active configuration source cannot be updated.
 
     Example Request:
         ```json
@@ -321,6 +329,42 @@ async def update_mcp_configuration(request: Request, body: McpConfigUpdateReques
     try:
         await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
         _validate_mcp_update_request(body)
+
+        if is_db_config_enabled():
+            from deerflow.config.app_config import get_app_config
+
+            store = DbExtensionsConfigStore(database_config=get_app_config().database)
+            current = store.load_extensions_config()
+            current_config = current.config
+            raw_servers = {name: McpServerConfigResponse(**server.model_dump()) for name, server in current_config.mcp_servers.items()}
+            raw_other_keys = dict(current_config.model_extra or {})
+
+            merged_servers: dict[str, McpServerConfigResponse] = {}
+            for name, incoming in body.mcp_servers.items():
+                existing = raw_servers.get(name)
+                merged_servers[name] = _merge_preserving_secrets(incoming, existing) if existing is not None else incoming
+
+            config_data = dict(raw_other_keys)
+            config_data["mcpServers"] = {name: server.model_dump() for name, server in merged_servers.items()}
+            config_data["skills"] = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
+
+            try:
+                store.save_extensions_config(
+                    ExtensionsConfig.model_validate(config_data),
+                    updated_by=_updated_by(request),
+                    expected_revision=current.revision,
+                )
+            except ExtensionsConfigConflictError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="MCP configuration was modified by another process; reload and retry.",
+                ) from exc
+            logger.info("MCP configuration updated in DB runtime config")
+
+            reloaded_config = reload_extensions_config()
+            reset_mcp_tools_cache()
+            servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_config.mcp_servers.items()}
+            return McpConfigResponse(mcp_servers=servers)
 
         # Get the current config path (or determine where to save it)
         config_path = ExtensionsConfig.resolve_config_path()
@@ -364,7 +408,7 @@ async def update_mcp_configuration(request: Request, body: McpConfigUpdateReques
         config_data["mcpServers"] = {name: server.model_dump() for name, server in merged_servers.items()}
         config_data["skills"] = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
 
-        # Write the configuration to file
+        # Write the configuration to the file-backed extensions source.
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2)
 

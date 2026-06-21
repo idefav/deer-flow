@@ -25,8 +25,10 @@ from uuid import UUID
 
 import pytest
 from fastapi import FastAPI, Request
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
-from app.channels.runtime_config_store import ChannelRuntimeConfigStore
+from app.channels.runtime_config_store import ChannelRuntimeConfigStore, merge_runtime_channel_configs
 from app.gateway.routers.channel_connections import (
     ChannelRuntimeConfigRequest,
     configure_channel_provider_runtime,
@@ -34,6 +36,8 @@ from app.gateway.routers.channel_connections import (
 )
 from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
 from deerflow.config.channel_connections_config import ChannelConnectionsConfig
+from deerflow.config.database_config import DatabaseConfig
+from deerflow.persistence.runtime_config.model import RuntimeConfigRow
 
 # Pre-import: the handlers import this module lazily; the import's file IO
 # must happen at collection time, not on the event loop under the gate.
@@ -173,3 +177,70 @@ async def test_runtime_config_store_chmod_failure_is_logged_not_fatal(tmp_path, 
     mode = await asyncio.to_thread(lambda: path.stat().st_mode & 0o777)
     assert mode == 0o600
     assert await asyncio.to_thread(store.get_provider_config, "slack") == {"enabled": True, "bot_token": "xoxb-ui"}
+
+
+async def test_runtime_config_store_factory_uses_db_in_db_config_mode(tmp_path, monkeypatch) -> None:
+    from app.channels.runtime_config_store import DbChannelRuntimeConfigStore, get_channel_runtime_config_store
+
+    database_config = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    file_runtime_path = tmp_path / "channels" / "runtime-config.json"
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+
+    store = await asyncio.to_thread(
+        get_channel_runtime_config_store,
+        file_runtime_path,
+        database_config=database_config,
+    )
+
+    assert isinstance(store, DbChannelRuntimeConfigStore)
+    await asyncio.to_thread(
+        store.set_provider_config,
+        "slack",
+        {"enabled": True, "bot_token": "xoxb-ui", "app_token": "xapp-ui"},
+    )
+
+    def _load_channel_runtime_payload() -> dict:
+        engine = create_engine(f"sqlite:///{database_config.sqlite_path}")
+        with Session(engine) as session:
+            row = session.get(RuntimeConfigRow, "channel_runtime")
+            assert row is not None
+            return row.payload_json
+
+    assert await asyncio.to_thread(_load_channel_runtime_payload) == {
+        "slack": {"enabled": True, "bot_token": "xoxb-ui", "app_token": "xapp-ui"}
+    }
+    assert not file_runtime_path.exists()
+
+
+async def test_merge_runtime_channel_configs_loads_db_store_by_default(tmp_path, monkeypatch) -> None:
+    from app.channels.runtime_config_store import DbChannelRuntimeConfigStore
+
+    database_config = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    set_app_config(
+        AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database_config.model_dump(),
+            }
+        )
+    )
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    seed_store = await asyncio.to_thread(DbChannelRuntimeConfigStore, database_config=database_config)
+    await asyncio.to_thread(
+        seed_store.set_provider_config,
+        "slack",
+        {"enabled": True, "bot_token": "xoxb-db", "app_token": "xapp-db"},
+    )
+    channels_config: dict[str, dict] = {}
+    connections = ChannelConnectionsConfig.model_validate(
+        {
+            "enabled": True,
+            "slack": {"enabled": True},
+        }
+    )
+
+    await asyncio.to_thread(merge_runtime_channel_configs, channels_config, connections)
+
+    assert channels_config == {
+        "slack": {"enabled": True, "bot_token": "xoxb-db", "app_token": "xapp-db"}
+    }

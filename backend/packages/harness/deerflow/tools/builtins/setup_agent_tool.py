@@ -5,7 +5,8 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import Command
 
-from deerflow.config.agents_config import validate_agent_name
+from deerflow.config.agents_config import AgentConfig, save_agent_config, save_default_agent_soul, validate_agent_name
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import get_paths
 from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.tools.types import Runtime
@@ -53,6 +54,33 @@ def setup_agent(
 
     try:
         agent_name = validate_agent_name(agent_name)
+        if agent_name and is_db_config_enabled():
+            user_id = resolve_runtime_user_id(runtime)
+            save_agent_config(
+                agent_name,
+                AgentConfig(name=agent_name, description=description, skills=skills),
+                soul,
+                user_id=user_id,
+            )
+            logger.info("[agent_creator] Created DB-backed agent '%s' for user=%s", agent_name, user_id)
+            return Command(
+                update={
+                    "created_agent_name": agent_name,
+                    "messages": [ToolMessage(content=f"Agent '{agent_name}' created successfully!", tool_call_id=runtime.tool_call_id)],
+                }
+            )
+
+        if agent_name is None and is_db_config_enabled():
+            user_id = resolve_runtime_user_id(runtime)
+            save_default_agent_soul(soul, user_id=user_id)
+            logger.info("[agent_creator] Created DB-backed default agent SOUL for user=%s", user_id)
+            return Command(
+                update={
+                    "created_agent_name": agent_name,
+                    "messages": [ToolMessage(content="Agent 'None' created successfully!", tool_call_id=runtime.tool_call_id)],
+                }
+            )
+
         paths = get_paths()
         if agent_name:
             # Custom agents are persisted under the current user's bucket so

@@ -6,6 +6,7 @@ from pathlib import Path
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
+from deerflow.skills.storage import get_or_new_skill_storage
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ class LocalSandboxProvider(SandboxProvider):
             from deerflow.config import get_app_config
 
             config = get_app_config()
-            skills_path = config.skills.get_skills_path()
+            skills_path = get_or_new_skill_storage(app_config=config).get_skills_root_path()
             container_path = config.skills.container_path
 
             # Only add mapping if skills directory exists

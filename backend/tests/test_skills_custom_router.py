@@ -13,6 +13,11 @@ from fastapi.testclient import TestClient
 from app.gateway.deps import get_config
 from app.gateway.routers import skills as skills_router
 from app.gateway.routers import uploads as uploads_router
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+from deerflow.config.database_config import DatabaseConfig
+from deerflow.config.extensions_config import ExtensionsConfig, reset_extensions_config
+from deerflow.config.extensions_sources import DbExtensionsConfigStore
+from deerflow.config.skills_config import SkillsConfig
 from deerflow.skills.storage import get_or_new_skill_storage
 from deerflow.skills.types import Skill
 
@@ -435,3 +440,64 @@ def test_update_skill_refreshes_prompt_cache_before_return(monkeypatch, tmp_path
     assert response.json()["enabled"] is False
     assert refresh_calls == ["refresh"]
     assert json.loads(config_path.read_text(encoding="utf-8")) == {"mcpServers": {}, "skills": {"demo-skill": {"enabled": False}}}
+
+
+def test_update_skill_db_mode_writes_extensions_runtime_config(monkeypatch, tmp_path):
+    database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    skills_root = tmp_path / "skills"
+    app_config = AppConfig.model_validate(
+        {
+            "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+            "database": database.model_dump(),
+            "skills": SkillsConfig(path=str(skills_root)).model_dump(),
+        }
+    )
+    store = DbExtensionsConfigStore(database_config=database)
+    store.save_extensions_config(
+        ExtensionsConfig.model_validate(
+            {
+                "mcpServers": {"github": {"type": "stdio", "command": "npx"}},
+                "skills": {},
+                "mcpInterceptors": ["pkg.module:build"],
+            }
+        )
+    )
+    enabled_state = {"value": True}
+    refresh_calls = []
+
+    def _load_skills(*, enabled_only: bool):
+        skill = _make_skill("demo-skill", enabled=enabled_state["value"])
+        if enabled_only and not skill.enabled:
+            return []
+        return [skill]
+
+    async def _refresh():
+        refresh_calls.append("refresh")
+        enabled_state["value"] = False
+
+    def fail_file_resolution():
+        raise AssertionError("DB mode must not resolve an extensions_config.json path")
+
+    set_app_config(app_config)
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    reset_extensions_config()
+    monkeypatch.setattr("app.gateway.routers.skills.get_or_new_skill_storage", lambda **kwargs: SimpleNamespace(load_skills=_load_skills))
+    monkeypatch.setattr(skills_router.ExtensionsConfig, "resolve_config_path", staticmethod(fail_file_resolution))
+    monkeypatch.setattr("app.gateway.routers.skills.refresh_skills_system_prompt_cache_async", _refresh)
+
+    try:
+        app = _make_test_app(app_config)
+        with TestClient(app) as client:
+            response = client.put("/api/skills/demo-skill", json={"enabled": False})
+    finally:
+        reset_app_config()
+        reset_extensions_config()
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    assert refresh_calls == ["refresh"]
+
+    stored = store.load_extensions_config().config
+    assert stored.skills["demo-skill"].enabled is False
+    assert "github" in stored.mcp_servers
+    assert stored.model_extra["mcpInterceptors"] == ["pkg.module:build"]

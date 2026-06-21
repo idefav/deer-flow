@@ -188,7 +188,7 @@ async def _skill_manage_impl(
             if not await _to_thread(target.exists):
                 raise FileNotFoundError(f"Supporting file '{path}' not found for skill '{name}'.")
             prev_content = await _to_thread(target.read_text, encoding="utf-8")
-            await _to_thread(target.unlink)
+            await _to_thread(skill_storage.delete_custom_skill_file, name, path)
             await _to_thread(
                 skill_storage.append_history,
                 name,

@@ -34,6 +34,28 @@ class _SyncProvider(SandboxProvider):
         return None
 
 
+class _EagerProvider(SandboxProvider):
+    def __init__(self) -> None:
+        self.thread_ids: list[str | None] = []
+        self.sandbox = _SandboxStub("eager-sandbox")
+
+    def acquire(self, thread_id: str | None = None) -> str:
+        self.thread_ids.append(thread_id)
+        return "eager-sandbox"
+
+    async def acquire_async(self, thread_id: str | None = None) -> str:
+        self.thread_ids.append(thread_id)
+        return "eager-sandbox"
+
+    def get(self, sandbox_id: str) -> Sandbox | None:
+        if sandbox_id == "eager-sandbox":
+            return self.sandbox
+        return None
+
+    def release(self, sandbox_id: str) -> None:
+        return None
+
+
 class _SandboxStub(Sandbox):
     def execute_command(self, command: str) -> str:
         return "OK"
@@ -146,6 +168,53 @@ async def test_abefore_agent_uses_async_provider_acquire() -> None:
 
     assert result == {"sandbox": {"sandbox_id": "async-sandbox"}}
     assert provider.thread_ids == ["thread-2"]
+
+
+def test_before_agent_materializes_eager_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deerflow.sandbox import tools as tools_module
+
+    provider = _EagerProvider()
+    calls: list[tuple[Runtime, Sandbox, str]] = []
+
+    def fake_materialize(runtime: Runtime, sandbox: Sandbox, sandbox_id: str) -> None:
+        calls.append((runtime, sandbox, sandbox_id))
+
+    monkeypatch.setattr(tools_module, "_materialize_runtime_context_from_db", fake_materialize)
+    set_sandbox_provider(provider)
+    try:
+        runtime = Runtime(context={"thread_id": "thread-eager"})
+
+        result = SandboxMiddleware(lazy_init=False).before_agent({}, runtime)
+    finally:
+        reset_sandbox_provider()
+
+    assert result == {"sandbox": {"sandbox_id": "eager-sandbox"}}
+    assert provider.thread_ids == ["thread-eager"]
+    assert calls == [(runtime, provider.sandbox, "eager-sandbox")]
+
+
+@pytest.mark.anyio
+async def test_abefore_agent_materializes_eager_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deerflow.sandbox import tools as tools_module
+
+    provider = _EagerProvider()
+    calls: list[tuple[Runtime, Sandbox, str]] = []
+
+    async def fake_materialize(runtime: Runtime, sandbox: Sandbox, sandbox_id: str) -> None:
+        calls.append((runtime, sandbox, sandbox_id))
+
+    monkeypatch.setattr(tools_module, "_materialize_runtime_context_from_db_async", fake_materialize)
+    set_sandbox_provider(provider)
+    try:
+        runtime = Runtime(context={"thread_id": "thread-eager-async"})
+
+        result = await SandboxMiddleware(lazy_init=False).abefore_agent({}, runtime)
+    finally:
+        reset_sandbox_provider()
+
+    assert result == {"sandbox": {"sandbox_id": "eager-sandbox"}}
+    assert provider.thread_ids == ["thread-eager-async"]
+    assert calls == [(runtime, provider.sandbox, "eager-sandbox")]
 
 
 @pytest.mark.anyio

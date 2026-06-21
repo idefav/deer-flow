@@ -10,7 +10,21 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from deerflow.config.agents_api_config import get_agents_api_config
-from deerflow.config.agents_config import AgentConfig, list_custom_agents, load_agent_config, load_agent_soul
+from deerflow.config.agents_config import (
+    AgentConfig,
+    DefaultAgentSoulConflictError,
+    agent_config_exists,
+    delete_agent_config,
+    list_custom_agents,
+    load_agent_config,
+    load_agent_soul,
+    load_default_agent_soul_state,
+    load_user_profile,
+    save_agent_config,
+    save_default_agent_soul_state,
+    save_user_profile,
+)
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 
@@ -148,6 +162,10 @@ async def check_agent_name(name: str) -> dict:
     _validate_agent_name(name)
     normalized = _normalize_agent_name(name)
     user_id = get_effective_user_id()
+    if is_db_config_enabled():
+        available = not agent_config_exists(normalized, user_id=user_id)
+        return {"available": available, "name": normalized}
+
     paths = get_paths()
     # Treat the name as taken if either the per-user path or the legacy shared
     # path holds an agent — picking a name that collides with an unmigrated
@@ -212,6 +230,36 @@ async def create_agent_endpoint(request: AgentCreateRequest) -> AgentResponse:
     _validate_agent_name(request.name)
     normalized_name = _normalize_agent_name(request.name)
     user_id = get_effective_user_id()
+
+    if is_db_config_enabled():
+        def _create_db_agent() -> AgentResponse | None:
+            if agent_config_exists(normalized_name, user_id=user_id):
+                return None
+            agent_cfg = save_agent_config(
+                normalized_name,
+                AgentConfig(
+                    name=normalized_name,
+                    description=request.description,
+                    model=request.model,
+                    tool_groups=request.tool_groups,
+                    skills=request.skills,
+                ),
+                request.soul,
+                user_id=user_id,
+            )
+            logger.info("Created DB-backed agent '%s' for user=%s", normalized_name, user_id)
+            return _agent_config_to_response(agent_cfg, include_soul=True, user_id=user_id)
+
+        try:
+            response = await asyncio.to_thread(_create_db_agent)
+        except Exception as e:
+            logger.error(f"Failed to create agent '{request.name}': {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to create agent: {str(e)}")
+
+        if response is None:
+            raise HTTPException(status_code=409, detail=f"Agent '{normalized_name}' already exists")
+        return response
+
     paths = get_paths()
 
     def _create_agent() -> AgentResponse | None:
@@ -299,6 +347,26 @@ async def update_agent(name: str, request: AgentUpdateRequest) -> AgentResponse:
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
 
+    if is_db_config_enabled():
+        try:
+            fields_set = request.model_fields_set
+            updated_cfg = AgentConfig(
+                name=agent_cfg.name,
+                description=request.description if "description" in fields_set and request.description is not None else agent_cfg.description,
+                model=request.model if "model" in fields_set else agent_cfg.model,
+                tool_groups=request.tool_groups if "tool_groups" in fields_set else agent_cfg.tool_groups,
+                skills=request.skills if "skills" in fields_set else agent_cfg.skills,
+            )
+            updated_soul = request.soul if request.soul is not None else (load_agent_soul(name, user_id=user_id) or "")
+            refreshed_cfg = await asyncio.to_thread(save_agent_config, name, updated_cfg, updated_soul, user_id=user_id)
+            logger.info("Updated DB-backed agent '%s' for user=%s", name, user_id)
+            return _agent_config_to_response(refreshed_cfg, include_soul=True, user_id=user_id)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to update agent '{name}': {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to update agent: {str(e)}")
+
     paths = get_paths()
     agent_dir = paths.user_agent_dir(user_id, name)
     if not agent_dir.exists() and paths.agent_dir(name).exists():
@@ -368,6 +436,20 @@ class UserProfileUpdateRequest(BaseModel):
     content: str = Field(default="", description="USER.md content — describes the user's background and preferences")
 
 
+class DefaultAgentSoulResponse(BaseModel):
+    """Response model for the default agent's SOUL.md content."""
+
+    content: str | None = Field(default=None, description="Default-agent SOUL.md content, or null if not yet created")
+    revision: int = Field(default=0, description="Revision for conditional default-agent SOUL updates")
+
+
+class DefaultAgentSoulUpdateRequest(BaseModel):
+    """Request body for setting the default agent's SOUL.md content."""
+
+    content: str = Field(default="", description="SOUL.md content — default agent personality and behavioral guardrails")
+    expected_revision: int | None = Field(default=None, description="Optional revision precondition for safe concurrent updates")
+
+
 @router.get(
     "/user-profile",
     response_model=UserProfileResponse,
@@ -383,11 +465,8 @@ async def get_user_profile() -> UserProfileResponse:
     _require_agents_api_enabled()
 
     try:
-        user_md_path = get_paths().user_md_file
-        if not user_md_path.exists():
-            return UserProfileResponse(content=None)
-        raw = user_md_path.read_text(encoding="utf-8").strip()
-        return UserProfileResponse(content=raw or None)
+        user_id = get_effective_user_id()
+        return UserProfileResponse(content=load_user_profile(user_id=user_id))
     except Exception as e:
         logger.error(f"Failed to read user profile: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to read user profile: {str(e)}")
@@ -411,14 +490,61 @@ async def update_user_profile(request: UserProfileUpdateRequest) -> UserProfileR
     _require_agents_api_enabled()
 
     try:
-        paths = get_paths()
-        paths.base_dir.mkdir(parents=True, exist_ok=True)
-        paths.user_md_file.write_text(request.content, encoding="utf-8")
-        logger.info(f"Updated USER.md at {paths.user_md_file}")
-        return UserProfileResponse(content=request.content or None)
+        user_id = get_effective_user_id()
+        content = save_user_profile(request.content, user_id=user_id)
+        logger.info("Updated user profile for user=%s", user_id)
+        return UserProfileResponse(content=content)
     except Exception as e:
         logger.error(f"Failed to update user profile: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to update user profile: {str(e)}")
+
+
+@router.get(
+    "/default-agent-soul",
+    response_model=DefaultAgentSoulResponse,
+    summary="Get Default Agent SOUL",
+    description="Read the default agent's SOUL.md content.",
+)
+async def get_default_agent_soul() -> DefaultAgentSoulResponse:
+    """Return the current default-agent SOUL.md content."""
+    _require_agents_api_enabled()
+
+    try:
+        user_id = get_effective_user_id()
+        state = load_default_agent_soul_state(user_id=user_id)
+        return DefaultAgentSoulResponse(content=state.content, revision=state.revision)
+    except Exception as e:
+        logger.error(f"Failed to read default agent SOUL: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to read default agent SOUL: {str(e)}")
+
+
+@router.put(
+    "/default-agent-soul",
+    response_model=DefaultAgentSoulResponse,
+    summary="Update Default Agent SOUL",
+    description="Write the default agent's SOUL.md content.",
+)
+async def update_default_agent_soul(request: DefaultAgentSoulUpdateRequest) -> DefaultAgentSoulResponse:
+    """Create or overwrite the default-agent SOUL.md content."""
+    _require_agents_api_enabled()
+
+    try:
+        user_id = get_effective_user_id()
+        state = save_default_agent_soul_state(
+            request.content,
+            user_id=user_id,
+            expected_revision=request.expected_revision,
+        )
+        logger.info("Updated default agent SOUL for user=%s", user_id)
+        return DefaultAgentSoulResponse(content=state.content, revision=state.revision)
+    except DefaultAgentSoulConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Default-agent SOUL was modified by another process; reload and retry.",
+        ) from exc
+    except Exception as e:
+        logger.error(f"Failed to update default agent SOUL: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update default agent SOUL: {str(e)}")
 
 
 @router.delete(
@@ -441,6 +567,18 @@ async def delete_agent(name: str) -> None:
     _validate_agent_name(name)
     name = _normalize_agent_name(name)
     user_id = get_effective_user_id()
+
+    if is_db_config_enabled():
+        try:
+            deleted = await asyncio.to_thread(delete_agent_config, name, user_id=user_id)
+        except Exception as e:
+            logger.error(f"Failed to delete agent '{name}': {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to delete agent: {str(e)}")
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Agent '{name}' not found")
+        logger.info("Deleted DB-backed agent '%s' for user=%s", name, user_id)
+        return None
+
     paths = get_paths()
 
     def _remove_agent_dir() -> tuple[str, str]:

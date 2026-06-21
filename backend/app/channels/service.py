@@ -377,8 +377,8 @@ async def start_channel_service(app_config: AppConfig | None = None) -> ChannelS
     global _channel_service
     if _channel_service is not None:
         return _channel_service
-    # from_app_config reads the JSON channel store and runtime config files;
-    # keep that disk IO off the event loop.
+    # from_app_config reads channel stores and runtime config backends; keep
+    # that blocking IO off the event loop.
     _channel_service = await asyncio.to_thread(ChannelService.from_app_config, app_config)
     await _channel_service.start()
     return _channel_service

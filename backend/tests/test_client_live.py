@@ -1,30 +1,40 @@
 """Live integration tests for DeerFlowClient with real API.
 
-These tests require a working config.yaml with valid API credentials.
+These tests require an active file/DB model config with valid API credentials.
 They are skipped in CI and must be run explicitly:
 
     PYTHONPATH=. uv run pytest tests/test_client_live.py -v -s
 """
 
 import json
-import os
-from pathlib import Path
 
 import pytest
+from support.live_gate_readiness import load_active_app_config_for_requires_llm, requires_llm_skip_reason
 
-from deerflow.client import DeerFlowClient, StreamEvent
 from deerflow.sandbox.security import is_host_bash_allowed
 from deerflow.uploads.manager import PathTraversalError
 
-# Skip entire module in CI or when no config.yaml exists
-_skip_reason = None
-if os.environ.get("CI"):
-    _skip_reason = "Live tests skipped in CI"
-elif not Path(__file__).resolve().parents[2].joinpath("config.yaml").exists():
-    _skip_reason = "No config.yaml found — live tests require valid API credentials"
+pytestmark = [pytest.mark.live, pytest.mark.requires_llm]
+
+
+def _live_test_skip_reason() -> str | None:
+    """Return the module-level live-test skip reason, if the entrypoint is not ready."""
+    reason = requires_llm_skip_reason()
+    if reason is not None:
+        return reason
+    try:
+        load_active_app_config_for_requires_llm()
+    except Exception as exc:
+        return f"Could not load active model config for live tests: {exc}"
+
+    return None
+
+
+# Skip entire module in CI or when the selected config source is not ready.
+_skip_reason = _live_test_skip_reason()
 
 if _skip_reason:
-    pytest.skip(_skip_reason, allow_module_level=True)
+    pytestmark.append(pytest.mark.skip(reason=_skip_reason))
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -34,6 +44,8 @@ if _skip_reason:
 @pytest.fixture(scope="module")
 def client():
     """Create a real DeerFlowClient (no mocks)."""
+    from deerflow.client import DeerFlowClient
+
     return DeerFlowClient(thinking_enabled=False)
 
 
@@ -74,6 +86,8 @@ class TestLiveBasicChat:
 class TestLiveStreaming:
     def test_stream_yields_messages_tuple_and_end(self, client):
         """stream() produces at least one messages-tuple event and ends with end."""
+        from deerflow.client import StreamEvent
+
         events = list(client.stream("Say hi in one word."))
 
         types = [e.type for e in events]

@@ -5,8 +5,13 @@ Mirrors the pattern used by ``deerflow/sandbox/sandbox_provider.py``.
 
 from __future__ import annotations
 
+from deerflow.config.bootstrap import is_db_config_enabled
+from deerflow.skills.storage.db_skill_storage import DbSkillStorage
 from deerflow.skills.storage.local_skill_storage import LocalSkillStorage
-from deerflow.skills.storage.skill_storage import SkillStorage
+from deerflow.skills.storage.skill_storage import SkillFileManifest, SkillStorage
+
+_LOCAL_SKILL_STORAGE_CLASS = "deerflow.skills.storage.local_skill_storage:LocalSkillStorage"
+_DB_SKILL_STORAGE_CLASS = "deerflow.skills.storage.db_skill_storage:DbSkillStorage"
 
 _default_skill_storage: SkillStorage | None = None
 _default_skill_storage_config: object | None = None  # AppConfig identity the singleton was built from
@@ -33,7 +38,10 @@ def get_or_new_skill_storage(**kwargs) -> SkillStorage:
     def _make_storage(skills_config: SkillsConfig, *, host_path: str | None = None, **kwargs) -> SkillStorage:
         from deerflow.reflection import resolve_class
 
-        cls = resolve_class(skills_config.use, SkillStorage)
+        class_path = skills_config.use
+        if is_db_config_enabled() and class_path == _LOCAL_SKILL_STORAGE_CLASS:
+            class_path = _DB_SKILL_STORAGE_CLASS
+        cls = resolve_class(class_path, SkillStorage)
         return cls(
             host_path=host_path if host_path is not None else str(skills_config.get_skills_path()),
             container_path=skills_config.container_path,
@@ -76,7 +84,9 @@ def reset_skill_storage() -> None:
 
 
 __all__ = [
+    "DbSkillStorage",
     "LocalSkillStorage",
+    "SkillFileManifest",
     "SkillStorage",
     "get_or_new_skill_storage",
     "reset_skill_storage",

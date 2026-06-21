@@ -19,11 +19,13 @@ from deerflow.agents.memory.queue import (
     reset_memory_queue,
 )
 from deerflow.agents.memory.storage import (
+    DbMemoryStorage,
     FileMemoryStorage,
     MemoryStorage,
     get_memory_storage,
 )
 from deerflow.agents.memory.updater import (
+    MemoryUpdateFailureReason,
     MemoryUpdater,
     clear_memory_data,
     delete_memory_fact,
@@ -45,9 +47,11 @@ __all__ = [
     "reset_memory_queue",
     # Storage
     "MemoryStorage",
+    "DbMemoryStorage",
     "FileMemoryStorage",
     "get_memory_storage",
     # Updater
+    "MemoryUpdateFailureReason",
     "MemoryUpdater",
     "clear_memory_data",
     "delete_memory_fact",

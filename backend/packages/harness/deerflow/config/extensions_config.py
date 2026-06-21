@@ -226,6 +226,25 @@ class ExtensionsConfig(BaseModel):
 
 
 _extensions_config: ExtensionsConfig | None = None
+_extensions_revision: int | None = None
+
+
+def _load_db_extensions_config_revisioned():
+    from deerflow.config.app_config import get_app_config
+    from deerflow.config.bootstrap import get_bootstrap_database_config
+    from deerflow.config.extensions_sources import DbExtensionsConfigStore
+
+    try:
+        database_config = get_app_config().database
+    except Exception:
+        database_config = get_bootstrap_database_config()
+    if database_config is None:
+        raise RuntimeError("DB extensions config mode requires an initialized AppConfig or DEER_FLOW_DATABASE_URL")
+    return DbExtensionsConfigStore(database_config=database_config).load_extensions_config()
+
+
+def _load_db_extensions_config() -> ExtensionsConfig:
+    return _load_db_extensions_config_revisioned().config
 
 
 def get_extensions_config() -> ExtensionsConfig:
@@ -237,9 +256,18 @@ def get_extensions_config() -> ExtensionsConfig:
     Returns:
         The cached ExtensionsConfig instance.
     """
-    global _extensions_config
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    global _extensions_config, _extensions_revision
+    if is_db_config_enabled():
+        loaded = _load_db_extensions_config_revisioned()
+        if _extensions_config is None or _extensions_revision != loaded.revision:
+            _extensions_config = loaded.config
+            _extensions_revision = loaded.revision
+        return _extensions_config
     if _extensions_config is None:
         _extensions_config = ExtensionsConfig.from_file()
+        _extensions_revision = None
     return _extensions_config
 
 
@@ -256,9 +284,27 @@ def reload_extensions_config(config_path: str | None = None) -> ExtensionsConfig
     Returns:
         The newly loaded ExtensionsConfig instance.
     """
-    global _extensions_config
-    _extensions_config = ExtensionsConfig.from_file(config_path)
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    global _extensions_config, _extensions_revision
+    if is_db_config_enabled():
+        loaded = _load_db_extensions_config_revisioned()
+        _extensions_config = loaded.config
+        _extensions_revision = loaded.revision
+    else:
+        _extensions_config = ExtensionsConfig.from_file() if config_path is None else ExtensionsConfig.from_file(config_path)
+        _extensions_revision = None
     return _extensions_config
+
+
+def get_extensions_config_revision() -> int | None:
+    """Return the active extensions config revision when the source exposes one."""
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    global _extensions_revision
+    if is_db_config_enabled():
+        get_extensions_config()
+    return _extensions_revision
 
 
 def reset_extensions_config() -> None:
@@ -268,8 +314,9 @@ def reset_extensions_config() -> None:
     `get_extensions_config()` to reload from file. Useful for testing
     or when switching between different configurations.
     """
-    global _extensions_config
+    global _extensions_config, _extensions_revision
     _extensions_config = None
+    _extensions_revision = None
 
 
 def set_extensions_config(config: ExtensionsConfig) -> None:
@@ -280,5 +327,6 @@ def set_extensions_config(config: ExtensionsConfig) -> None:
     Args:
         config: The ExtensionsConfig instance to use.
     """
-    global _extensions_config
+    global _extensions_config, _extensions_revision
     _extensions_config = config
+    _extensions_revision = None

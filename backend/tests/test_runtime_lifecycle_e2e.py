@@ -201,6 +201,9 @@ def _reset_process_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
         (app_config_module, "_app_config_path", None),
         (app_config_module, "_app_config_mtime", None),
         (app_config_module, "_app_config_is_custom", False),
+        (app_config_module, "_app_config_source_kind", "file"),
+        (app_config_module, "_app_config_db_revision", None),
+        (app_config_module, "_app_config_db_content_hash", None),
         (extensions_config_module, "_extensions_config", None),
         (paths_module, "_paths_singleton", None),
         (paths_module, "_paths", None),
@@ -263,6 +266,70 @@ def isolated_app(isolated_deer_flow_home: Path, monkeypatch: pytest.MonkeyPatch)
     from app.gateway.app import create_app
 
     return create_app()
+
+
+async def _seed_db_runtime_config(db_url: str, payload: dict[str, Any]) -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from deerflow.persistence.base import Base
+    from deerflow.persistence.runtime_config import RuntimeConfigRepository
+
+    engine = create_async_engine(db_url)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    repository = RuntimeConfigRepository(async_sessionmaker(engine, expire_on_commit=False))
+    await repository.upsert("app", payload)
+    await repository.upsert("extensions", {"mcpServers": {}, "skills": {}})
+    await engine.dispose()
+
+
+def _minimal_db_app_payload() -> dict[str, Any]:
+    return {
+        "log_level": "info",
+        "models": [
+            {
+                "name": "fake-test-model",
+                "display_name": "Fake Test Model",
+                "use": "langchain_openai:ChatOpenAI",
+                "model": "gpt-4o-mini",
+                "api_key": "$OPENAI_API_KEY",
+                "base_url": "$OPENAI_API_BASE",
+            }
+        ],
+        "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+        "agents_api": {"enabled": True},
+        "title": {"enabled": False},
+        "memory": {"enabled": False},
+        "database": {"backend": "memory"},
+        "run_events": {"backend": "memory"},
+    }
+
+
+@pytest.fixture
+def isolated_db_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "deer-flow-home"
+    home.mkdir()
+    db_path = tmp_path / "bootstrap-db" / "deerflow.db"
+    db_url = f"sqlite+aiosqlite:///{db_path}"
+    missing_config = tmp_path / "missing-config.yaml"
+    missing_extensions_config = tmp_path / "missing-extensions.json"
+
+    monkeypatch.setenv("DEER_FLOW_HOME", str(home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-key-not-used")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://example.invalid")
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    monkeypatch.setenv("DEER_FLOW_DATABASE_URL", db_url)
+    monkeypatch.setenv("DEER_FLOW_CONFIG_PATH", str(missing_config))
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(missing_extensions_config))
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    asyncio.run(_seed_db_runtime_config(db_url, _minimal_db_app_payload()))
+    _preserve_process_config_singletons(monkeypatch)
+    _reset_process_singletons(monkeypatch)
+
+    from app.gateway.app import create_app
+
+    return create_app(), missing_config, missing_extensions_config
 
 
 def _register_user(client, *, email: str = "runtime-e2e@example.com") -> str:
@@ -476,6 +543,54 @@ def test_stream_run_completes_and_persists_runtime_state(isolated_app):
         assert "llm.ai.response" in event_types
         assert any(row["content"]["content"] == "Run lifecycle E2E prompt" for row in message_events if row["event_type"] == "llm.human.input")
         assert any(row["content"]["content"] == "Lifecycle complete." for row in message_events if row["event_type"] == "llm.ai.response")
+
+
+def test_db_mode_stream_run_completes_without_local_runtime_config_files(isolated_db_app):
+    """DB config mode should run through gateway startup and runs without runtime config files."""
+    from starlette.testclient import TestClient
+
+    isolated_app, missing_config, missing_extensions_config = isolated_db_app
+    controller = _RunController()
+    factory = _make_agent_factory(
+        controller,
+        title="DB Mode Lifecycle E2E",
+        answer="DB mode lifecycle complete.",
+    )
+
+    with (
+        patch("app.gateway.services.resolve_agent_factory", return_value=factory),
+        TestClient(isolated_app) as client,
+    ):
+        csrf_token = _register_user(client, email="db-mode-runtime-e2e@example.com")
+        thread_id = _create_thread(client, csrf_token)
+
+        with client.stream(
+            "POST",
+            f"/api/threads/{thread_id}/runs/stream",
+            json=_run_body(),
+            headers={"X-CSRF-Token": csrf_token},
+        ) as response:
+            assert response.status_code == 200, response.read().decode()
+            run_id = _run_id_from_response(response)
+            transcript = _drain_stream(response)
+
+        events = _parse_sse(transcript)
+        assert [event["event"] for event in events] == ["metadata", "values", "end"]
+        assert events[0]["data"] == {"run_id": run_id, "thread_id": thread_id}
+        assert events[1]["data"]["title"] == "DB Mode Lifecycle E2E"
+        assert events[1]["data"]["messages"][-1]["content"] == "DB mode lifecycle complete."
+
+        run = client.get(f"/api/threads/{thread_id}/runs/{run_id}")
+        assert run.status_code == 200, run.text
+        assert run.json()["status"] == "success"
+
+        thread = client.get(f"/api/threads/{thread_id}")
+        assert thread.status_code == 200, thread.text
+        assert thread.json()["status"] == "idle"
+        assert thread.json()["values"]["title"] == "DB Mode Lifecycle E2E"
+
+    assert not missing_config.exists()
+    assert not missing_extensions_config.exists()
 
 
 def test_stream_run_executes_real_lead_agent_setup_agent_business_path(isolated_app, isolated_deer_flow_home: Path):

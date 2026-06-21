@@ -52,10 +52,10 @@ def _get_work_dir(thread_id: str | None) -> str:
 
 def _build_mcp_servers() -> dict[str, dict[str, Any]]:
     """Build ACP ``mcpServers`` config from DeerFlow's enabled MCP servers."""
-    from deerflow.config.extensions_config import ExtensionsConfig
+    from deerflow.config.extensions_config import reload_extensions_config
     from deerflow.mcp.client import build_servers_config
 
-    return build_servers_config(ExtensionsConfig.from_file())
+    return build_servers_config(reload_extensions_config())
 
 
 def _build_acp_mcp_servers() -> list[dict[str, Any]]:
@@ -65,9 +65,9 @@ def _build_acp_mcp_servers() -> list[dict[str, Any]]:
     returns a name -> config mapping for the LangChain MCP adapter. This helper
     converts the enabled servers into the ACP wire format.
     """
-    from deerflow.config.extensions_config import ExtensionsConfig
+    from deerflow.config.extensions_config import reload_extensions_config
 
-    extensions_config = ExtensionsConfig.from_file()
+    extensions_config = reload_extensions_config()
     enabled_servers = extensions_config.get_enabled_mcp_servers()
 
     mcp_servers: list[dict[str, Any]] = []

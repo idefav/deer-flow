@@ -38,6 +38,7 @@ from deerflow.agents.lead_agent.prompt import apply_prompt_template
 from deerflow.agents.thread_state import ThreadState
 from deerflow.config.agents_config import AGENT_NAME_PATTERN
 from deerflow.config.app_config import get_app_config, reload_app_config
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
 from deerflow.config.paths import get_paths
 from deerflow.models import create_chat_model
@@ -953,7 +954,9 @@ class DeerFlowClient:
     def update_mcp_config(self, mcp_servers: dict[str, dict]) -> dict:
         """Update MCP server configurations.
 
-        Writes to extensions_config.json and reloads the cache.
+        Writes to the active extensions source and reloads the cache. In DB
+        config mode this updates ``runtime_configs.extensions`` instead of
+        resolving or writing ``extensions_config.json``.
 
         Args:
             mcp_servers: Dict mapping server name to config dict.
@@ -966,6 +969,32 @@ class DeerFlowClient:
         Raises:
             OSError: If the config file cannot be written.
         """
+        if is_db_config_enabled():
+            from deerflow.config.extensions_sources import DbExtensionsConfigStore, ExtensionsConfigConflictError
+            from deerflow.mcp.cache import reset_mcp_tools_cache
+
+            store = DbExtensionsConfigStore(database_config=self._app_config.database)
+            current = store.load_extensions_config()
+            current_config = current.config
+            config_data = dict(current_config.model_extra or {})
+            config_data["mcpServers"] = mcp_servers
+            config_data["skills"] = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
+
+            try:
+                store.save_extensions_config(
+                    ExtensionsConfig.model_validate(config_data),
+                    updated_by=get_effective_user_id(),
+                    expected_revision=current.revision,
+                )
+            except ExtensionsConfigConflictError as exc:
+                raise RuntimeError("MCP configuration was modified by another process; reload and retry.") from exc
+
+            self._agent = None
+            self._agent_config_key = None
+            reloaded = reload_extensions_config()
+            reset_mcp_tools_cache()
+            return {"mcp_servers": {name: server.model_dump() for name, server in reloaded.mcp_servers.items()}}
+
         config_path = ExtensionsConfig.resolve_config_path()
         if config_path is None:
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
@@ -1030,6 +1059,41 @@ class DeerFlowClient:
         skill = next((s for s in skills if s.name == name), None)
         if skill is None:
             raise ValueError(f"Skill '{name}' not found")
+
+        if is_db_config_enabled():
+            from deerflow.config.extensions_sources import DbExtensionsConfigStore, ExtensionsConfigConflictError
+
+            store = DbExtensionsConfigStore(database_config=self._app_config.database)
+            current = store.load_extensions_config()
+            extensions_config = current.config
+            config_data = dict(extensions_config.model_extra or {})
+            config_data["mcpServers"] = {server_name: server.model_dump() for server_name, server in extensions_config.mcp_servers.items()}
+            config_data["skills"] = {skill_name: {"enabled": skill_config.enabled} for skill_name, skill_config in extensions_config.skills.items()}
+            config_data["skills"][name] = {"enabled": enabled}
+
+            try:
+                store.save_extensions_config(
+                    ExtensionsConfig.model_validate(config_data),
+                    updated_by=get_effective_user_id(),
+                    expected_revision=current.revision,
+                )
+            except ExtensionsConfigConflictError as exc:
+                raise RuntimeError("Skills configuration was modified by another process; reload and retry.") from exc
+
+            self._agent = None
+            self._agent_config_key = None
+            reload_extensions_config()
+
+            updated = next((s for s in get_or_new_skill_storage().load_skills(enabled_only=False) if s.name == name), None)
+            if updated is None:
+                raise RuntimeError(f"Skill '{name}' disappeared after update")
+            return {
+                "name": updated.name,
+                "description": updated.description,
+                "license": updated.license,
+                "category": updated.category,
+                "enabled": updated.enabled,
+            }
 
         config_path = ExtensionsConfig.resolve_config_path()
         if config_path is None:

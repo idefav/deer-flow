@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from deerflow.agents.memory.prompt import format_conversation_for_update
 from deerflow.agents.memory.updater import (
+    MemoryUpdateFailureReason,
     MemoryUpdater,
     _extract_text,
     clear_memory_data,
@@ -37,6 +38,16 @@ def _memory_config(**overrides: object) -> MemoryConfig:
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+def test_memory_update_failure_reason_is_exported_from_memory_package() -> None:
+    from deerflow.agents.memory import MemoryUpdateFailureReason as exported
+
+    assert exported is MemoryUpdateFailureReason
+
+
+def test_memory_config_has_update_context_budget_default() -> None:
+    assert MemoryConfig().max_update_context_tokens == 12000
 
 
 def test_apply_updates_skips_existing_duplicate_and_preserves_removals() -> None:
@@ -111,6 +122,66 @@ def test_prepare_update_prompt_preserves_non_ascii_memory_text() -> None:
     _, prompt = prepared
     assert "Deer-flow是一个非常好的框架。" in prompt
     assert "\\u" not in prompt
+
+
+def test_prepare_update_prompt_uses_budgeted_memory_snapshot_without_trimming_persisted_state(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "deerflow.agents.memory.prompt._count_tokens",
+        lambda text, encoding_name="cl100k_base", *, use_tiktoken=True: len(text),
+    )
+    updater = MemoryUpdater()
+    current_memory = _make_memory(
+        facts=[
+            {
+                "id": "fact_high",
+                "content": "High priority fact should fit.",
+                "category": "preference",
+                "confidence": 0.99,
+                "createdAt": "2026-06-20T00:00:00Z",
+                "source": "thread-high",
+            },
+            {
+                "id": "fact_low",
+                "content": "Low priority fact should be omitted from the update prompt because it is far too verbose. " * 8,
+                "category": "context",
+                "confidence": 0.4,
+                "createdAt": "2026-06-19T00:00:00Z",
+                "source": "thread-low",
+            },
+        ]
+    )
+    current_memory["user"]["workContext"]["summary"] = "Harness stateless DB mode work."
+    current_memory["history"]["longTermBackground"]["summary"] = "Prefers repo-aware implementation."
+
+    with (
+        patch(
+            "deerflow.agents.memory.updater.get_memory_config",
+                return_value=_memory_config(
+                    enabled=True,
+                    max_update_context_tokens=1200,
+                    token_counting="char",
+                ),
+        ),
+        patch("deerflow.agents.memory.updater.get_memory_data", return_value=current_memory),
+    ):
+        msg = MagicMock()
+        msg.type = "human"
+        msg.content = "继续实现 stateless DB mode"
+        prepared = updater._prepare_update_prompt(
+            [msg],
+            agent_name=None,
+            correction_detected=False,
+            reinforcement_detected=False,
+        )
+
+    assert prepared is not None
+    returned_memory, prompt = prepared
+    assert returned_memory is current_memory
+    assert "Harness stateless DB mode work." in prompt
+    assert "Prefers repo-aware implementation." in prompt
+    assert "High priority fact should fit." in prompt
+    assert "Low priority fact should be omitted" not in prompt
+    assert current_memory["facts"][1]["id"] == "fact_low"
 
 
 def test_apply_updates_skips_same_batch_duplicates_and_keeps_source_metadata() -> None:
@@ -1081,12 +1152,15 @@ class TestFinalizeCacheIsolation:
 
         saved_objects: list[dict] = []
         save_mock = MagicMock(side_effect=lambda m, a=None, **_: saved_objects.append(m) or False)  # always fails
+        mock_storage = MagicMock()
+        mock_storage.save = save_mock
+        mock_storage.reload = MagicMock(return_value=original_memory)
 
         with (
             patch.object(updater, "_get_model", return_value=mock_model),
             patch("deerflow.agents.memory.updater.get_memory_config", return_value=_memory_config(enabled=True, fact_confidence_threshold=0.7)),
             patch("deerflow.agents.memory.updater.get_memory_data", return_value=original_memory),
-            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=MagicMock(save=save_mock)),
+            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=mock_storage),
         ):
             msg = MagicMock()
             msg.type = "human"
@@ -1098,12 +1172,151 @@ class TestFinalizeCacheIsolation:
             updater.update_memory([msg, ai_msg], thread_id="t1")
 
         # save_mock must have been exercised — otherwise the deepcopy-on-save-failure path isn't covered
-        save_mock.assert_called_once()
-        assert len(saved_objects) == 1, "save must have been called with the updated memory object"
+        assert save_mock.call_count == 2
+        assert len(saved_objects) == 2, "save must have been called with updated memory objects"
 
         # original_memory must not have been mutated — deepcopy isolates the mutation
         assert len(original_memory["facts"]) == 1, "original_memory must not be mutated by _apply_updates"
         assert original_memory["facts"][0]["content"] == "original"
+
+    def test_finalize_reloads_and_retries_on_stale_save_failure(self):
+        updater = MemoryUpdater()
+        original_memory = _make_memory()
+        fresh_memory = _make_memory(
+            facts=[
+                {
+                    "id": "fact_other",
+                    "content": "Other update already saved",
+                    "category": "context",
+                    "confidence": 0.9,
+                    "createdAt": "2024-01-01T00:00:00Z",
+                    "source": "other-thread",
+                }
+            ]
+        )
+
+        import json as _json
+
+        response_content = _json.dumps(
+            {
+                "user": {},
+                "history": {},
+                "newFacts": [{"content": "Retried fact", "category": "context", "confidence": 0.9}],
+                "factsToRemove": [],
+            }
+        )
+        mock_storage = MagicMock()
+        mock_storage.save = MagicMock(side_effect=[False, True])
+        mock_storage.reload = MagicMock(return_value=fresh_memory)
+
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config", return_value=_memory_config(enabled=True, fact_confidence_threshold=0.7)),
+            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=mock_storage),
+        ):
+            result = updater._finalize_update(
+                current_memory=original_memory,
+                response_content=response_content,
+                thread_id="retry-thread",
+                agent_name=None,
+                user_id="user-42",
+            )
+
+        assert result is True
+        mock_storage.reload.assert_called_once_with(None, user_id="user-42")
+        assert mock_storage.save.call_count == 2
+        retry_payload = mock_storage.save.call_args_list[1].args[0]
+        assert [fact["content"] for fact in retry_payload["facts"]] == [
+            "Other update already saved",
+            "Retried fact",
+        ]
+
+    def test_finalize_records_typed_reason_when_retry_save_fails(self):
+        updater = MemoryUpdater()
+        original_memory = _make_memory()
+        fresh_memory = _make_memory()
+
+        import json as _json
+
+        response_content = _json.dumps(
+            {
+                "user": {},
+                "history": {},
+                "newFacts": [{"content": "Unsaved fact", "category": "context", "confidence": 0.9}],
+                "factsToRemove": [],
+            }
+        )
+        mock_storage = MagicMock()
+        mock_storage.save = MagicMock(side_effect=[False, False])
+        mock_storage.reload = MagicMock(return_value=fresh_memory)
+
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config", return_value=_memory_config(enabled=True, fact_confidence_threshold=0.7)),
+            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=mock_storage),
+        ):
+            result = updater._finalize_update(
+                current_memory=original_memory,
+                response_content=response_content,
+                thread_id="retry-thread",
+                agent_name=None,
+                user_id="user-42",
+            )
+
+        assert result is False
+        assert updater.last_failure_reason is MemoryUpdateFailureReason.SAVE_RETRY_EXHAUSTED
+
+    def test_finalize_clears_previous_failure_reason_after_success(self):
+        updater = MemoryUpdater()
+        original_memory = _make_memory()
+
+        import json as _json
+
+        response_content = _json.dumps(
+            {
+                "user": {},
+                "history": {},
+                "newFacts": [{"content": "Saved fact", "category": "context", "confidence": 0.9}],
+                "factsToRemove": [],
+            }
+        )
+        failing_storage = MagicMock()
+        failing_storage.save = MagicMock(side_effect=[False, False])
+        failing_storage.reload = MagicMock(return_value=_make_memory())
+        success_storage = MagicMock()
+        success_storage.save = MagicMock(return_value=True)
+
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config", return_value=_memory_config(enabled=True, fact_confidence_threshold=0.7)),
+            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=failing_storage),
+        ):
+            assert (
+                updater._finalize_update(
+                    current_memory=original_memory,
+                    response_content=response_content,
+                    thread_id="retry-thread",
+                    agent_name=None,
+                    user_id="user-42",
+                )
+                is False
+            )
+
+        assert updater.last_failure_reason is MemoryUpdateFailureReason.SAVE_RETRY_EXHAUSTED
+
+        with (
+            patch("deerflow.agents.memory.updater.get_memory_config", return_value=_memory_config(enabled=True, fact_confidence_threshold=0.7)),
+            patch("deerflow.agents.memory.updater.get_memory_storage", return_value=success_storage),
+        ):
+            assert (
+                updater._finalize_update(
+                    current_memory=_make_memory(),
+                    response_content=response_content,
+                    thread_id="retry-thread",
+                    agent_name=None,
+                    user_id="user-42",
+                )
+                is True
+            )
+
+        assert updater.last_failure_reason is None
 
 
 class TestUserIdForwarding:

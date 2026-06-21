@@ -12,8 +12,9 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.channels.runtime_config_store import (
-    ChannelRuntimeConfigStore,
+    ChannelRuntimeConfigStoreProtocol,
     apply_runtime_connection_config,
+    get_channel_runtime_config_store,
     merge_runtime_channel_configs,
 )
 from app.gateway.deps import require_admin_user
@@ -143,13 +144,13 @@ def _get_app_config():
     return get_app_config()
 
 
-async def _get_runtime_config_store(request: Request) -> ChannelRuntimeConfigStore:
+async def _get_runtime_config_store(request: Request) -> ChannelRuntimeConfigStoreProtocol:
     store = getattr(request.app.state, "channel_runtime_config_store", None)
-    if isinstance(store, ChannelRuntimeConfigStore):
+    if isinstance(store, ChannelRuntimeConfigStoreProtocol):
         return store
-    # Constructing the store reads its JSON file from disk; keep it off the
+    # Constructing the store can touch local files or the DB; keep it off the
     # event loop.
-    store = await asyncio.to_thread(ChannelRuntimeConfigStore)
+    store = await asyncio.to_thread(get_channel_runtime_config_store)
     request.app.state.channel_runtime_config_store = store
     return store
 
@@ -158,7 +159,11 @@ async def _get_channel_connections_config(request: Request) -> ChannelConnection
     config = getattr(request.app.state, "channel_connections_config", None)
     if not isinstance(config, ChannelConnectionsConfig):
         config = _get_app_config().channel_connections
-    config = apply_runtime_connection_config(config, store=await _get_runtime_config_store(request))
+    config = await asyncio.to_thread(
+        apply_runtime_connection_config,
+        config,
+        store=await _get_runtime_config_store(request),
+    )
     request.app.state.channel_connections_config = config
     return config
 
@@ -178,7 +183,8 @@ async def _load_channels_config(request: Request, config: ChannelConnectionsConf
     extra = app_config.model_extra or {}
     channels_config = extra.get("channels")
     result = dict(channels_config) if isinstance(channels_config, dict) else {}
-    merge_runtime_channel_configs(
+    await asyncio.to_thread(
+        merge_runtime_channel_configs,
         result,
         config,
         store=await _get_runtime_config_store(request),

@@ -28,10 +28,12 @@ except ImportError:  # pragma: no cover - Windows fallback
     import msvcrt
 
 from deerflow.config import get_app_config
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
+from deerflow.skills.storage import get_or_new_skill_storage
 
 from .aio_sandbox import AioSandbox
 from .backend import SandboxBackend, wait_for_sandbox_ready, wait_for_sandbox_ready_async
@@ -289,20 +291,34 @@ class AioSandboxProvider(SandboxProvider):
     def _get_extra_mounts(self, thread_id: str | None) -> list[tuple[str, str, bool]]:
         """Collect all extra mounts for a sandbox (thread-specific + skills)."""
         mounts: list[tuple[str, str, bool]] = []
+        db_config_enabled = is_db_config_enabled()
+        skills_container_path = self._get_skills_container_path()
 
         if thread_id:
-            mounts.extend(self._get_thread_mounts(thread_id))
+            mounts.extend(
+                self._get_thread_mounts(
+                    thread_id,
+                    include_db_skills_mount=db_config_enabled,
+                    skills_container_path=skills_container_path,
+                )
+            )
             logger.info(f"Adding thread mounts for thread {thread_id}: {mounts}")
 
-        skills_mount = self._get_skills_mount()
-        if skills_mount:
-            mounts.append(skills_mount)
-            logger.info(f"Adding skills mount: {skills_mount}")
+        if not db_config_enabled:
+            skills_mount = self._get_skills_mount()
+            if skills_mount:
+                mounts.append(skills_mount)
+                logger.info(f"Adding skills mount: {skills_mount}")
 
         return mounts
 
     @staticmethod
-    def _get_thread_mounts(thread_id: str) -> list[tuple[str, str, bool]]:
+    def _get_thread_mounts(
+        thread_id: str,
+        *,
+        include_db_skills_mount: bool = False,
+        skills_container_path: str = "/mnt/skills",
+    ) -> list[tuple[str, str, bool]]:
         """Get volume mounts for a thread's data directories.
 
         Creates directories if they don't exist (lazy initialization).
@@ -313,7 +329,7 @@ class AioSandboxProvider(SandboxProvider):
         user_id = get_effective_user_id()
         paths.ensure_thread_dirs(thread_id, user_id=user_id)
 
-        return [
+        mounts = [
             (paths.host_sandbox_work_dir(thread_id, user_id=user_id), f"{VIRTUAL_PATH_PREFIX}/workspace", False),
             (paths.host_sandbox_uploads_dir(thread_id, user_id=user_id), f"{VIRTUAL_PATH_PREFIX}/uploads", False),
             (paths.host_sandbox_outputs_dir(thread_id, user_id=user_id), f"{VIRTUAL_PATH_PREFIX}/outputs", False),
@@ -321,6 +337,16 @@ class AioSandboxProvider(SandboxProvider):
             # the ACP subprocess writes from the host side, not from within the container).
             (paths.host_acp_workspace_dir(thread_id, user_id=user_id), "/mnt/acp-workspace", True),
         ]
+        if include_db_skills_mount:
+            mounts.append((paths.host_sandbox_skills_dir(thread_id, user_id=user_id), skills_container_path, False))
+        return mounts
+
+    @staticmethod
+    def _get_skills_container_path() -> str:
+        try:
+            return get_app_config().skills.container_path or "/mnt/skills"
+        except Exception:
+            return "/mnt/skills"
 
     @staticmethod
     def _get_skills_mount() -> tuple[str, str, bool] | None:
@@ -331,7 +357,7 @@ class AioSandboxProvider(SandboxProvider):
         """
         try:
             config = get_app_config()
-            skills_path = config.skills.get_skills_path()
+            skills_path = get_or_new_skill_storage(app_config=config).get_skills_root_path()
             container_path = config.skills.container_path
 
             if skills_path.exists():

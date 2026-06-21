@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import logging
 import os
@@ -223,26 +224,57 @@ class AppConfig(BaseModel):
         # Check config version before processing
         cls._check_config_version(config_data, resolved_path)
 
-        config_data = cls.resolve_env_variables(config_data)
-        cls._apply_database_defaults(config_data)
-
-        # Load circuit_breaker config if present
-        if "circuit_breaker" in config_data:
-            config_data["circuit_breaker"] = config_data["circuit_breaker"]
-
         # Load extensions config separately (it's in a different file)
         extensions_config = ExtensionsConfig.from_file()
-        config_data["extensions"] = extensions_config.model_dump()
+        return cls.from_payload(config_data, extensions_config=extensions_config, source_label=resolved_path)
 
-        result = cls.model_validate(config_data)
+    @classmethod
+    def from_payload(
+        cls,
+        config_data: Mapping[str, Any],
+        *,
+        extensions_config: ExtensionsConfig | None = None,
+        source_label: str | Path | None = None,
+        apply_singletons: bool = True,
+    ) -> Self:
+        """Validate an app config payload using the same semantics as file loading."""
+        payload = copy.deepcopy(dict(config_data))
+        payload = cls.resolve_env_variables(payload)
+        cls._apply_database_defaults(payload)
+
+        # Load circuit_breaker config if present
+        if "circuit_breaker" in payload:
+            payload["circuit_breaker"] = payload["circuit_breaker"]
+
+        extensions_config = extensions_config or ExtensionsConfig()
+        payload["extensions"] = extensions_config.model_dump()
+
+        result = cls.model_validate(payload)
         if not result.models:
             logger.warning(
                 "No models are configured in %s. Add at least one entry under `models:` (see the commented examples in config.example.yaml) or run `make setup`.",
-                resolved_path,
+                source_label or "<payload>",
             )
-        acp_agents = cls._validate_acp_agents(config_data.get("acp_agents", {}))
-        cls._apply_singleton_configs(result, acp_agents)
+        acp_agents = cls._validate_acp_agents(payload.get("acp_agents", {}))
+        if apply_singletons:
+            cls._apply_singleton_configs(result, acp_agents)
         return result
+
+    @classmethod
+    def from_source(
+        cls,
+        source: Any,
+        *,
+        extensions_config: ExtensionsConfig | None = None,
+        apply_singletons: bool = True,
+    ) -> Self:
+        """Load and validate app config from a synchronous runtime config source."""
+        revisioned_payload = source.load_app_config_payload()
+        return cls.from_payload(
+            revisioned_payload.payload,
+            extensions_config=extensions_config,
+            apply_singletons=apply_singletons,
+        )
 
     @classmethod
     def _validate_acp_agents(
@@ -404,6 +436,9 @@ _app_config_mtime: float | None = None
 _ConfigSignature = tuple[float | None, int | None, str | None]
 _app_config_signature: _ConfigSignature | None = None
 _app_config_is_custom = False
+_app_config_source_kind = "file"
+_app_config_db_revision: int | None = None
+_app_config_db_content_hash: str | None = None
 _current_app_config: ContextVar[AppConfig | None] = ContextVar("deerflow_current_app_config", default=None)
 _current_app_config_stack: ContextVar[tuple[AppConfig | None, ...]] = ContextVar("deerflow_current_app_config_stack", default=())
 
@@ -436,7 +471,7 @@ def _get_config_signature(config_path: Path) -> _ConfigSignature | None:
 
 def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:
     """Load config from disk and refresh cache metadata."""
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_source_kind, _app_config_db_revision, _app_config_db_content_hash
 
     resolved_path = AppConfig.resolve_config_path(config_path)
     _app_config = AppConfig.from_file(str(resolved_path))
@@ -444,7 +479,68 @@ def _load_and_cache_app_config(config_path: str | None = None) -> AppConfig:
     _app_config_mtime = _get_config_mtime(resolved_path)
     _app_config_signature = _get_config_signature(resolved_path)
     _app_config_is_custom = False
+    _app_config_source_kind = "file"
+    _app_config_db_revision = None
+    _app_config_db_content_hash = None
     return _app_config
+
+
+async def load_and_cache_db_app_config(
+    repository: Any,
+    *,
+    database_config: DatabaseConfig | None = None,
+    extensions_config: ExtensionsConfig | None = None,
+    apply_singletons: bool = True,
+) -> AppConfig:
+    """Load DB-backed app config during async startup and cache it for sync readers."""
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_source_kind, _app_config_db_revision, _app_config_db_content_hash
+
+    from deerflow.config.sources import DbConfigSource
+
+    revisioned_payload = await DbConfigSource(repository).load_app_config_payload()
+    payload = copy.deepcopy(revisioned_payload.payload)
+    if database_config is not None:
+        payload["database"] = database_config.model_dump()
+    _app_config = AppConfig.from_payload(
+        payload,
+        extensions_config=extensions_config,
+        source_label="db:runtime_configs.app",
+        apply_singletons=apply_singletons,
+    )
+    _app_config_path = None
+    _app_config_mtime = None
+    _app_config_signature = None
+    _app_config_is_custom = False
+    _app_config_source_kind = "db"
+    _app_config_db_revision = revisioned_payload.revision
+    _app_config_db_content_hash = revisioned_payload.content_hash
+    return _app_config
+
+
+async def load_and_cache_bootstrap_db_app_config() -> AppConfig:
+    """Load DB-backed app config from bootstrap environment settings."""
+    from deerflow.config.bootstrap import get_bootstrap_database_config
+
+    database_config = get_bootstrap_database_config()
+    if database_config is None:
+        raise RuntimeError("DEER_FLOW_DATABASE_URL is required when DEER_FLOW_CONFIG_SOURCE=db")
+
+    from deerflow.config.extensions_sources import DbExtensionsConfigSource
+    from deerflow.persistence.engine import get_session_factory, init_engine_from_config
+    from deerflow.persistence.runtime_config import RuntimeConfigRepository
+
+    await init_engine_from_config(database_config)
+    session_factory = get_session_factory()
+    if session_factory is None:
+        raise RuntimeError("DB config mode requires sqlite or postgres persistence; memory backend is not valid")
+
+    repository = RuntimeConfigRepository(session_factory)
+    extensions_config = (await DbExtensionsConfigSource(repository).load_extensions_config()).config
+    return await load_and_cache_db_app_config(
+        repository,
+        database_config=database_config,
+        extensions_config=extensions_config,
+    )
 
 
 def get_app_config() -> AppConfig:
@@ -463,6 +559,13 @@ def get_app_config() -> AppConfig:
 
     if _app_config is not None and _app_config_is_custom:
         return _app_config
+
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    if is_db_config_enabled():
+        if _app_config is not None and _app_config_source_kind == "db":
+            return _app_config
+        raise RuntimeError("DB config mode requires load_and_cache_db_app_config() during async startup before get_app_config() can be used")
 
     resolved_path = AppConfig.resolve_config_path()
     current_mtime = _get_config_mtime(resolved_path)
@@ -505,12 +608,15 @@ def reset_app_config() -> None:
     `get_app_config()` to reload from file. Useful for testing
     or when switching between different configurations.
     """
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_source_kind, _app_config_db_revision, _app_config_db_content_hash
     _app_config = None
     _app_config_path = None
     _app_config_mtime = None
     _app_config_signature = None
     _app_config_is_custom = False
+    _app_config_source_kind = "file"
+    _app_config_db_revision = None
+    _app_config_db_content_hash = None
 
 
 def set_app_config(config: AppConfig) -> None:
@@ -521,12 +627,15 @@ def set_app_config(config: AppConfig) -> None:
     Args:
         config: The AppConfig instance to use.
     """
-    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom
+    global _app_config, _app_config_path, _app_config_mtime, _app_config_signature, _app_config_is_custom, _app_config_source_kind, _app_config_db_revision, _app_config_db_content_hash
     _app_config = config
     _app_config_path = None
     _app_config_mtime = None
     _app_config_signature = None
     _app_config_is_custom = True
+    _app_config_source_kind = "custom"
+    _app_config_db_revision = None
+    _app_config_db_content_hash = None
 
 
 def peek_current_app_config() -> AppConfig | None:

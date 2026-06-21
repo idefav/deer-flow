@@ -7,6 +7,7 @@ preserves existing secrets when the frontend round-trips masked values.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,10 @@ from app.gateway.routers.mcp import (
     reset_mcp_tools_cache_endpoint,
     update_mcp_configuration,
 )
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+from deerflow.config.database_config import DatabaseConfig
+from deerflow.config.extensions_config import ExtensionsConfig, reset_extensions_config
+from deerflow.config.extensions_sources import DbExtensionsConfigStore, ExtensionsConfigConflictError, RevisionedExtensionsConfig
 
 # ---------------------------------------------------------------------------
 # _mask_server_config
@@ -508,3 +513,134 @@ def test_validate_mcp_update_ignores_remote_transports(monkeypatch):
     )
 
     _validate_mcp_update_request(request)
+
+
+@pytest.mark.asyncio
+async def test_update_mcp_configuration_db_mode_writes_runtime_config_and_preserves_secrets(monkeypatch, tmp_path):
+    database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    set_app_config(
+        AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+    )
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    store = DbExtensionsConfigStore(database_config=database)
+    store.save_extensions_config(
+        ExtensionsConfig.model_validate(
+            {
+                "mcpServers": {
+                    "github": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "env": {"GITHUB_TOKEN": "real-secret"},
+                    }
+                },
+                "skills": {"writer": {"enabled": False}},
+                "mcpInterceptors": ["pkg.module:build"],
+            }
+        )
+    )
+    reset_extensions_config()
+    reset_calls = 0
+
+    def fake_reset_mcp_tools_cache():
+        nonlocal reset_calls
+        reset_calls += 1
+
+    def fail_file_resolution():
+        raise AssertionError("DB mode must not resolve an extensions_config.json path")
+
+    monkeypatch.setattr(mcp_router, "reset_mcp_tools_cache", fake_reset_mcp_tools_cache)
+    monkeypatch.setattr(mcp_router.ExtensionsConfig, "resolve_config_path", staticmethod(fail_file_resolution))
+
+    try:
+        response = await update_mcp_configuration(
+            _request_with_role("admin"),
+            McpConfigUpdateRequest(
+                mcp_servers={
+                    "github": McpServerConfigResponse(
+                        enabled=False,
+                        type="stdio",
+                        command="npx",
+                        env={"GITHUB_TOKEN": "***"},
+                    )
+                }
+            ),
+        )
+    finally:
+        reset_app_config()
+        reset_extensions_config()
+
+    assert reset_calls == 1
+    assert response.mcp_servers["github"].enabled is False
+    assert response.mcp_servers["github"].env == {"GITHUB_TOKEN": "***"}
+
+    stored = store.load_extensions_config().config
+    assert stored.mcp_servers["github"].enabled is False
+    assert stored.mcp_servers["github"].env == {"GITHUB_TOKEN": "real-secret"}
+    assert stored.skills["writer"].enabled is False
+    assert stored.model_extra["mcpInterceptors"] == ["pkg.module:build"]
+
+
+@pytest.mark.asyncio
+async def test_update_mcp_configuration_db_mode_returns_409_on_revision_conflict(monkeypatch, tmp_path):
+    database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+    set_app_config(
+        AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+    )
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    existing_config = ExtensionsConfig.model_validate(
+        {
+            "mcpServers": {"github": {"type": "stdio", "command": "npx"}},
+            "skills": {},
+        }
+    )
+
+    class ConflictStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def load_extensions_config(self):
+            return RevisionedExtensionsConfig(
+                config=existing_config,
+                revision=7,
+                content_hash="hash",
+                updated_at=datetime.now(UTC),
+            )
+
+        def save_extensions_config(self, _config, *, updated_by=None, expected_revision=None):
+            assert updated_by == "user-1"
+            assert expected_revision == 7
+            raise ExtensionsConfigConflictError("extensions config revision conflict")
+
+    monkeypatch.setattr(mcp_router, "DbExtensionsConfigStore", ConflictStore)
+    monkeypatch.setattr(mcp_router, "get_extensions_config", lambda: existing_config)
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await update_mcp_configuration(
+                _request_with_role("admin"),
+                McpConfigUpdateRequest(
+                    mcp_servers={
+                        "github": McpServerConfigResponse(
+                            enabled=False,
+                            type="stdio",
+                            command="npx",
+                        )
+                    }
+                ),
+            )
+    finally:
+        reset_app_config()
+        reset_extensions_config()
+
+    assert exc_info.value.status_code == 409
+    assert "modified by another process" in exc_info.value.detail

@@ -9,7 +9,9 @@ from app.gateway.deps import get_config
 from app.gateway.path_utils import resolve_thread_virtual_path
 from deerflow.agents.lead_agent.prompt import refresh_skills_system_prompt_cache_async
 from deerflow.config.app_config import AppConfig
+from deerflow.config.bootstrap import is_db_config_enabled
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig, get_extensions_config, reload_extensions_config
+from deerflow.config.extensions_sources import DbExtensionsConfigStore, ExtensionsConfigConflictError
 from deerflow.skills import Skill
 from deerflow.skills.installer import SkillAlreadyExistsError
 from deerflow.skills.security_scanner import scan_skill_content
@@ -305,7 +307,7 @@ async def get_skill(skill_name: str, config: AppConfig = Depends(get_config)) ->
     "/skills/{skill_name}",
     response_model=SkillResponse,
     summary="Update Skill",
-    description="Update a skill's enabled status by modifying the extensions_config.json file.",
+    description="Update a skill's enabled status in the active extensions configuration source.",
 )
 async def update_skill(skill_name: str, request: SkillUpdateRequest, config: AppConfig = Depends(get_config)) -> SkillResponse:
     try:
@@ -315,6 +317,35 @@ async def update_skill(skill_name: str, request: SkillUpdateRequest, config: App
 
         if skill is None:
             raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+
+        if is_db_config_enabled():
+            store = DbExtensionsConfigStore(database_config=config.database)
+            current = store.load_extensions_config()
+            extensions_config = current.config
+            config_data = dict(extensions_config.model_extra or {})
+            config_data["mcpServers"] = {name: server.model_dump() for name, server in extensions_config.mcp_servers.items()}
+            config_data["skills"] = {name: {"enabled": skill_config.enabled} for name, skill_config in extensions_config.skills.items()}
+            config_data["skills"][skill_name] = {"enabled": request.enabled}
+
+            try:
+                store.save_extensions_config(
+                    ExtensionsConfig.model_validate(config_data),
+                    expected_revision=current.revision,
+                )
+            except ExtensionsConfigConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Skills configuration was modified by another process; reload and retry.",
+                ) from exc
+            logger.info("Skill '%s' enabled status updated in DB to %s", skill_name, request.enabled)
+            reload_extensions_config()
+            await refresh_skills_system_prompt_cache_async()
+
+            skills = get_or_new_skill_storage(app_config=config).load_skills(enabled_only=False)
+            updated_skill = next((s for s in skills if s.name == skill_name), None)
+            if updated_skill is None:
+                raise HTTPException(status_code=500, detail=f"Failed to reload skill '{skill_name}' after update")
+            return _skill_to_response(updated_skill)
 
         config_path = ExtensionsConfig.resolve_config_path()
         if config_path is None:

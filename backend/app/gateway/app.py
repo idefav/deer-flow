@@ -29,6 +29,9 @@ from app.gateway.routers import (
     threads,
     uploads,
 )
+from app.gateway.routers import (
+    config as config_router,
+)
 from deerflow.config import app_config as deerflow_app_config
 from deerflow.config.app_config import apply_logging_level
 
@@ -48,6 +51,16 @@ logger = logging.getLogger(__name__)
 # Bounds worker exit time so uvicorn's reload supervisor does not keep
 # firing signals into a worker that is stuck waiting for shutdown cleanup.
 _SHUTDOWN_HOOK_TIMEOUT_SECONDS = 5.0
+
+
+async def _load_startup_config() -> AppConfig:
+    """Load the startup AppConfig snapshot from file or DB-backed bootstrap."""
+    from deerflow.config.bootstrap import is_db_config_enabled
+
+    if not is_db_config_enabled():
+        return get_app_config()
+
+    return await deerflow_app_config.load_and_cache_bootstrap_db_app_config()
 
 
 async def _ensure_admin_user(app: FastAPI) -> None:
@@ -171,7 +184,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # visible without a process restart. We deliberately do NOT cache this
     # snapshot on `app.state` to keep that contract enforceable.
     try:
-        startup_config = get_app_config()
+        startup_config = await _load_startup_config()
         apply_logging_level(startup_config.log_level)
         logger.info("Configuration loaded successfully")
         warn_if_auth_disabled_enabled()
@@ -324,6 +337,10 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
                 "description": "Manage IM channel integrations (Feishu, Slack, Telegram)",
             },
             {
+                "name": "config",
+                "description": "Inspect runtime configuration metadata and reload boundaries",
+            },
+            {
                 "name": "assistants-compat",
                 "description": "LangGraph Platform-compatible assistants API (stub)",
             },
@@ -390,6 +407,9 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
 
     # Channels API is mounted at /api/channels
     app.include_router(channels.router)
+
+    # Runtime config metadata API is mounted at /api/config
+    app.include_router(config_router.router)
 
     # Assistants compatibility API (LangGraph Platform stub)
     app.include_router(assistants_compat.router)

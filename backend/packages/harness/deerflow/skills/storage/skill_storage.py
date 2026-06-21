@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from deerflow.skills.types import SKILL_MD_FILE, Skill, SkillCategory  # noqa: F401
@@ -13,6 +15,15 @@ from deerflow.skills.types import SKILL_MD_FILE, Skill, SkillCategory  # noqa: F
 logger = logging.getLogger(__name__)
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+ALLOWED_SUPPORT_SUBDIRS = {"references", "templates", "scripts", "assets"}
+
+
+@dataclass(frozen=True)
+class SkillFileManifest:
+    relative_path: str
+    content_hash: str
+    mime_type: str
+    size: int
 
 
 class SkillStorage(ABC):
@@ -78,7 +89,6 @@ class SkillStorage(ABC):
 
     def ensure_safe_support_path(self, name: str, relative_path: str) -> Path:
         """Validate and return the resolved absolute path for a support file."""
-        _ALLOWED_SUPPORT_SUBDIRS = {"references", "templates", "scripts", "assets"}
         skill_dir = self.get_custom_skill_dir(self.validate_skill_name(name)).resolve()
         if not relative_path or relative_path.endswith("/"):
             raise ValueError("Supporting file path must include a filename.")
@@ -88,8 +98,8 @@ class SkillStorage(ABC):
         if any(part in {"..", ""} for part in relative.parts):
             raise ValueError("Supporting file path must not contain parent-directory traversal.")
         top_level = relative.parts[0] if relative.parts else ""
-        if top_level not in _ALLOWED_SUPPORT_SUBDIRS:
-            raise ValueError(f"Supporting files must live under one of: {', '.join(sorted(_ALLOWED_SUPPORT_SUBDIRS))}.")
+        if top_level not in ALLOWED_SUPPORT_SUBDIRS:
+            raise ValueError(f"Supporting files must live under one of: {', '.join(sorted(ALLOWED_SUPPORT_SUBDIRS))}.")
         target = (skill_dir / relative).resolve()
         allowed_root = (skill_dir / top_level).resolve()
         try:
@@ -97,6 +107,35 @@ class SkillStorage(ABC):
         except ValueError as exc:
             raise ValueError("Supporting file path must stay within the selected support directory.") from exc
         return target
+
+    @staticmethod
+    def _decode_skill_file_content(data: bytes) -> str | bytes:
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+
+    @staticmethod
+    def _mime_type_for_relative_path(relative_path: str, *, binary: bool) -> str:
+        if binary:
+            return "application/octet-stream"
+        if relative_path == SKILL_MD_FILE or relative_path.endswith(".md"):
+            return "text/markdown; charset=utf-8"
+        return "text/plain; charset=utf-8"
+
+    @classmethod
+    def _manifest_for_bytes(cls, relative_path: str, data: bytes) -> SkillFileManifest:
+        return SkillFileManifest(
+            relative_path=relative_path,
+            content_hash=hashlib.sha256(data).hexdigest(),
+            mime_type=cls._mime_type_for_relative_path(relative_path, binary=False),
+            size=len(data),
+        )
+
+    def _skill_dir_for_category(self, skill_name: str, category: SkillCategory | str) -> Path:
+        normalized_name = self.validate_skill_name(skill_name)
+        skill_category = SkillCategory(category)
+        return self.get_skills_root_path() / skill_category.value / normalized_name
 
     # ------------------------------------------------------------------
     # Abstract atomic operations (storage-medium specific)
@@ -124,6 +163,37 @@ class SkillStorage(ABC):
         Origin: ``deerflow.skills.manager.read_custom_skill_content``.
         """
 
+    def read_skill_file(self, skill_name: str, category: SkillCategory | str, relative_path: str) -> str | bytes:
+        """Read a single skill file without implying full-tree materialization."""
+        skill_dir = self._skill_dir_for_category(skill_name, category)
+        target = self.validate_relative_path(relative_path, skill_dir)
+        if not target.is_file():
+            raise FileNotFoundError(f"Skill file '{relative_path}' not found for skill '{skill_name}'.")
+        return self._decode_skill_file_content(target.read_bytes())
+
+    def list_skill_file_manifest(self, skill_name: str, category: SkillCategory | str) -> list[SkillFileManifest]:
+        """Return file metadata for a skill tree without reading through prompts."""
+        skill_dir = self._skill_dir_for_category(skill_name, category)
+        if not skill_dir.is_dir():
+            raise FileNotFoundError(f"Skill '{skill_name}' not found in category '{category}'.")
+
+        manifest: list[SkillFileManifest] = []
+        for path in sorted(child for child in skill_dir.rglob("*") if child.is_file()):
+            relative_path = path.relative_to(skill_dir).as_posix()
+            data = path.read_bytes()
+            manifest.append(
+                SkillFileManifest(
+                    relative_path=relative_path,
+                    content_hash=hashlib.sha256(data).hexdigest(),
+                    mime_type=self._mime_type_for_relative_path(
+                        relative_path,
+                        binary=isinstance(self._decode_skill_file_content(data), bytes),
+                    ),
+                    size=len(data),
+                )
+            )
+        return manifest
+
     @abstractmethod
     def write_custom_skill(self, name: str, relative_path: str, content: str) -> None:
         """Atomically write a text file under ``custom/<name>/<relative_path>``.
@@ -150,6 +220,18 @@ class SkillStorage(ABC):
 
         Origin: ``app.gateway.routers.skills.delete_custom_skill`` + ``skill_manage_tool``.
         """
+
+    def delete_custom_skill_file(self, name: str, relative_path: str) -> None:
+        """Delete a support file for a custom skill.
+
+        Storage backends that keep support files outside the materialized
+        filesystem should override this method and update their own source of
+        truth.
+        """
+        target = self.ensure_safe_support_path(name, relative_path)
+        if not target.exists():
+            raise FileNotFoundError(f"Supporting file '{relative_path}' not found for skill '{name}'.")
+        target.unlink()
 
     @abstractmethod
     def custom_skill_exists(self, name: str) -> bool:
@@ -231,9 +313,9 @@ class SkillStorage(ABC):
         # Merge enabled state from extensions config (re-read every call so
         # changes made by another process are picked up immediately).
         try:
-            from deerflow.config.extensions_config import ExtensionsConfig
+            from deerflow.config.extensions_config import reload_extensions_config
 
-            extensions_config = ExtensionsConfig.from_file()
+            extensions_config = reload_extensions_config()
             for skill in skills:
                 skill.enabled = extensions_config.is_skill_enabled(skill.name, skill.category)
         except Exception as e:

@@ -48,6 +48,10 @@ class SandboxConfig(BaseModel):
         default=False,
         description="Allow the bash tool to execute directly on the host when using LocalSandboxProvider. Dangerous; intended only for fully trusted local environments.",
     )
+    runtime_context_fail_closed: bool = Field(
+        default=False,
+        description="Fail sandbox initialization when DB-backed runtime context materialization fails. Keep disabled for compatibility; enable for strict stateless deployments.",
+    )
     image: str | None = Field(
         default=None,
         description="Docker image to use for the sandbox container",

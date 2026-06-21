@@ -111,17 +111,15 @@ def get_available_tools(
         logger.info(f"Including view_image_tool for model '{model_name}' (supports_vision=True)")
 
     # Get cached MCP tools if enabled
-    # NOTE: We use ExtensionsConfig.from_file() instead of config.extensions
-    # to always read the latest configuration from disk. This ensures that changes
-    # made through the Gateway API (which runs in a separate process) are immediately
-    # reflected when loading MCP tools.
+    # Reload the active extensions source so file mode picks up disk changes and
+    # DB mode picks up runtime_configs.extensions changes.
     mcp_tools = []
     if include_mcp:
         try:
-            from deerflow.config.extensions_config import ExtensionsConfig
+            from deerflow.config.extensions_config import reload_extensions_config
             from deerflow.mcp.cache import get_cached_mcp_tools
 
-            extensions_config = ExtensionsConfig.from_file()
+            extensions_config = reload_extensions_config()
             if extensions_config.get_enabled_mcp_servers():
                 mcp_tools = get_cached_mcp_tools()
                 if mcp_tools:

@@ -17,7 +17,10 @@ import pytest
 import yaml
 from langchain.tools import ToolRuntime
 
+from deerflow.config.agent_store import DbAgentStore
 from deerflow.config.agents_config import AgentConfig
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+from deerflow.config.database_config import DatabaseConfig
 from deerflow.tools.builtins.update_agent_tool import update_agent
 
 DEFAULT_USER = "test-user-autouse"  # matches the autouse fixture in tests/conftest.py
@@ -52,6 +55,10 @@ def _make_paths_mock(tmp_path: Path) -> MagicMock:
     paths.user_agent_dir = lambda user_id, name: tmp_path / "users" / user_id / "agents" / name
     paths.user_agents_dir = lambda user_id: tmp_path / "users" / user_id / "agents"
     return paths
+
+
+def _db_config(tmp_path: Path) -> DatabaseConfig:
+    return DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
 
 
 def _user_agent_dir(tmp_path: Path, name: str = "test-agent", user_id: str = DEFAULT_USER) -> Path:
@@ -381,3 +388,46 @@ def test_update_agent_round_trips_known_fields(tmp_path, patched_paths):
     assert cfg["skills"] == ["s1"]
     assert cfg["tool_groups"] == ["g1"]
     assert cfg["model"] == "m1"
+
+
+@pytest.mark.no_auto_user
+def test_update_agent_db_mode_updates_db_not_files(tmp_path, monkeypatch):
+    database = _db_config(tmp_path)
+    store = DbAgentStore(database_config=database)
+    store.save_agent(
+        "alice",
+        "db-agent",
+        AgentConfig(name="db-agent", description="old", skills=["existing"]),
+        "old soul",
+    )
+    set_app_config(
+        AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+    )
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+    runtime = _DummyRuntime(
+        context={"agent_name": "db-agent", "user_id": "alice"},
+        tool_call_id="tool-db",
+    )
+
+    try:
+        result = update_agent.func(
+            runtime=runtime,
+            description="new",
+            skills=[],
+            soul="new soul",
+        )
+    finally:
+        reset_app_config()
+
+    assert "updated successfully" in result.update["messages"][0].content
+    stored = store.load_agent_config("alice", "db-agent")
+    assert stored is not None
+    assert stored.description == "new"
+    assert stored.skills == []
+    assert store.load_agent_soul("alice", "db-agent") == "new soul"
+    assert not (tmp_path / "users" / "alice" / "agents" / "db-agent").exists()

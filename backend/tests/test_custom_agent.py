@@ -10,6 +10,8 @@ import yaml
 from fastapi.testclient import TestClient
 
 from deerflow.config.agents_api_config import AgentsApiConfig, get_agents_api_config, set_agents_api_config
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+from deerflow.config.database_config import DatabaseConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -459,6 +461,10 @@ def _make_test_app(tmp_path: Path):
     return app
 
 
+def _db_config(tmp_path: Path) -> DatabaseConfig:
+    return DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+
+
 @pytest.fixture()
 def agent_client(tmp_path):
     """TestClient with agents router, using tmp_path as base_dir."""
@@ -494,6 +500,37 @@ def disabled_agent_client(tmp_path):
                 yield client
         finally:
             set_agents_api_config(previous_config)
+
+
+@pytest.fixture()
+def db_agent_client(tmp_path, monkeypatch):
+    """TestClient with agents router running in DB config mode."""
+    import app.gateway.routers.agents as agents_router
+
+    paths_instance = _make_paths(tmp_path)
+    database = _db_config(tmp_path)
+    previous_agents_api_config = AgentsApiConfig(**get_agents_api_config().model_dump())
+    set_app_config(
+        AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+            }
+        )
+    )
+    monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+
+    with patch("deerflow.config.agents_config.get_paths", return_value=paths_instance), patch.object(agents_router, "get_paths", return_value=paths_instance):
+        set_agents_api_config(AgentsApiConfig(enabled=True))
+        try:
+            app = _make_test_app(tmp_path)
+            with TestClient(app) as client:
+                client._tmp_path = tmp_path  # type: ignore[attr-defined]
+                client._database_config = database  # type: ignore[attr-defined]
+                yield client
+        finally:
+            set_agents_api_config(previous_agents_api_config)
+            reset_app_config()
 
 
 class TestAgentsAPI:
@@ -675,6 +712,158 @@ class TestUserProfileAPI:
         assert response.json()["content"] is None
 
 
+class TestDefaultAgentSoulAPI:
+    def test_get_default_agent_soul_empty(self, agent_client):
+        response = agent_client.get("/api/default-agent-soul")
+        assert response.status_code == 200
+        assert response.json()["content"] is None
+        assert response.json()["revision"] == 0
+
+    def test_put_default_agent_soul(self, agent_client, tmp_path):
+        content = "# Default Agent\n\nUse careful reasoning."
+        response = agent_client.put("/api/default-agent-soul", json={"content": content})
+        assert response.status_code == 200
+        assert response.json()["content"] == content
+        assert response.json()["revision"] > 0
+
+        soul_md = tmp_path / "SOUL.md"
+        assert soul_md.exists()
+        assert soul_md.read_text(encoding="utf-8") == content
+
+    def test_get_default_agent_soul_after_put(self, agent_client):
+        content = "# Default Agent\n\nPrefer concise answers."
+        agent_client.put("/api/default-agent-soul", json={"content": content})
+
+        response = agent_client.get("/api/default-agent-soul")
+        assert response.status_code == 200
+        assert response.json()["content"] == content
+
+    def test_put_default_agent_soul_rejects_mismatched_revision(self, agent_client, tmp_path):
+        first_response = agent_client.put("/api/default-agent-soul", json={"content": "first"})
+        assert first_response.status_code == 200
+
+        stale_response = agent_client.put(
+            "/api/default-agent-soul",
+            json={"content": "stale write", "expected_revision": -1},
+        )
+
+        assert stale_response.status_code == 409
+        assert "modified by another process" in stale_response.json()["detail"]
+        assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "first"
+
+
+class TestAgentsAPIDbMode:
+    def test_create_update_delete_agent_uses_db_not_files(self, db_agent_client, tmp_path):
+        from deerflow.config.agent_store import DbAgentStore
+
+        payload = {
+            "name": "db-writer",
+            "description": "Writes from DB",
+            "soul": "# DB Soul",
+            "skills": [],
+        }
+        create_response = db_agent_client.post("/api/agents", json=payload)
+        assert create_response.status_code == 201
+        assert create_response.json()["skills"] == []
+
+        store = DbAgentStore(database_config=db_agent_client._database_config)  # type: ignore[attr-defined]
+        stored = store.load_agent_config("test-user-autouse", "db-writer")
+        assert stored is not None
+        assert stored.description == "Writes from DB"
+        assert stored.skills == []
+        assert store.load_agent_soul("test-user-autouse", "db-writer") == "# DB Soul"
+        assert not (tmp_path / "users" / "test-user-autouse" / "agents" / "db-writer").exists()
+
+        update_response = db_agent_client.put(
+            "/api/agents/db-writer",
+            json={"description": "Updated in DB", "soul": "# Updated"},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["description"] == "Updated in DB"
+        assert update_response.json()["soul"] == "# Updated"
+
+        stored = store.load_agent_config("test-user-autouse", "db-writer")
+        assert stored is not None
+        assert stored.description == "Updated in DB"
+        assert store.load_agent_soul("test-user-autouse", "db-writer") == "# Updated"
+        assert not (tmp_path / "users" / "test-user-autouse" / "agents" / "db-writer").exists()
+
+        delete_response = db_agent_client.delete("/api/agents/db-writer")
+        assert delete_response.status_code == 204
+        assert store.load_agent_config("test-user-autouse", "db-writer") is None
+        assert not (tmp_path / "users" / "test-user-autouse" / "agents" / "db-writer").exists()
+
+    def test_db_mode_duplicate_create_and_name_check_read_db(self, db_agent_client):
+        db_agent_client.post("/api/agents", json={"name": "taken-agent", "soul": "taken"})
+
+        check_response = db_agent_client.get("/api/agents/check", params={"name": "taken-agent"})
+        assert check_response.status_code == 200
+        assert check_response.json()["available"] is False
+
+        duplicate_response = db_agent_client.post("/api/agents", json={"name": "taken-agent", "soul": "again"})
+        assert duplicate_response.status_code == 409
+
+    def test_user_profile_uses_db_not_user_md_file(self, db_agent_client, tmp_path):
+        from deerflow.config.agent_store import DbAgentStore
+
+        content = "# DB Profile\n\nPrefers concise answers."
+        put_response = db_agent_client.put("/api/user-profile", json={"content": content})
+        assert put_response.status_code == 200
+        assert put_response.json()["content"] == content
+
+        get_response = db_agent_client.get("/api/user-profile")
+        assert get_response.status_code == 200
+        assert get_response.json()["content"] == content
+
+        store = DbAgentStore(database_config=db_agent_client._database_config)  # type: ignore[attr-defined]
+        assert store.load_user_profile("test-user-autouse") == content
+        assert not (tmp_path / "USER.md").exists()
+
+    def test_default_agent_soul_uses_db_not_soul_md_file(self, db_agent_client, tmp_path):
+        from deerflow.config.agent_store import DbAgentStore
+
+        content = "# DB Default Agent\n\nUse DB-backed identity."
+        put_response = db_agent_client.put("/api/default-agent-soul", json={"content": content})
+        assert put_response.status_code == 200
+        assert put_response.json()["content"] == content
+        assert put_response.json()["revision"] == 1
+
+        get_response = db_agent_client.get("/api/default-agent-soul")
+        assert get_response.status_code == 200
+        assert get_response.json()["content"] == content
+        assert get_response.json()["revision"] == 1
+
+        store = DbAgentStore(database_config=db_agent_client._database_config)  # type: ignore[attr-defined]
+        assert store.load_default_agent_soul("test-user-autouse") == content
+        assert not (tmp_path / "SOUL.md").exists()
+
+    def test_default_agent_soul_db_update_rejects_stale_revision(self, db_agent_client):
+        from deerflow.config.agent_store import DbAgentStore
+
+        create_response = db_agent_client.put("/api/default-agent-soul", json={"content": "first"})
+        assert create_response.status_code == 200
+        assert create_response.json()["revision"] == 1
+
+        update_response = db_agent_client.put(
+            "/api/default-agent-soul",
+            json={"content": "second", "expected_revision": 1},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["content"] == "second"
+        assert update_response.json()["revision"] == 2
+
+        stale_response = db_agent_client.put(
+            "/api/default-agent-soul",
+            json={"content": "stale", "expected_revision": 1},
+        )
+
+        assert stale_response.status_code == 409
+        assert "modified by another process" in stale_response.json()["detail"]
+
+        store = DbAgentStore(database_config=db_agent_client._database_config)  # type: ignore[attr-defined]
+        assert store.load_default_agent_soul("test-user-autouse") == "second"
+
+
 class TestAgentsApiDisabled:
     def test_agents_list_returns_403(self, disabled_agent_client):
         response = disabled_agent_client.get("/api/agents")
@@ -704,6 +893,13 @@ class TestAgentsApiDisabled:
     def test_user_profile_routes_return_403(self, disabled_agent_client):
         get_response = disabled_agent_client.get("/api/user-profile")
         put_response = disabled_agent_client.put("/api/user-profile", json={"content": "blocked"})
+
+        assert get_response.status_code == 403
+        assert put_response.status_code == 403
+
+    def test_default_agent_soul_routes_return_403(self, disabled_agent_client):
+        get_response = disabled_agent_client.get("/api/default-agent-soul")
+        put_response = disabled_agent_client.put("/api/default-agent-soul", json={"content": "blocked"})
 
         assert get_response.status_code == 403
         assert put_response.status_code == 403

@@ -278,6 +278,14 @@ class Paths:
         """
         return self.thread_dir(thread_id, user_id=user_id) / "acp-workspace"
 
+    def sandbox_skills_dir(self, thread_id: str, *, user_id: str | None = None) -> Path:
+        """
+        Writable per-thread skills directory used by stateless DB-mode sandbox materialization.
+        Host: `{base_dir}/threads/{thread_id}/skills/`
+        Sandbox: app config `skills.container_path` (default `/mnt/skills`)
+        """
+        return self.thread_dir(thread_id, user_id=user_id) / "skills"
+
     def sandbox_user_data_dir(self, thread_id: str, *, user_id: str | None = None) -> Path:
         """
         Host path for the user-data root.
@@ -312,6 +320,10 @@ class Paths:
         """Host path for the ACP workspace mount source."""
         return _join_host_path(self.host_thread_dir(thread_id, user_id=user_id), "acp-workspace")
 
+    def host_sandbox_skills_dir(self, thread_id: str, *, user_id: str | None = None) -> str:
+        """Host path for the writable DB-mode skills mount source."""
+        return _join_host_path(self.host_thread_dir(thread_id, user_id=user_id), "skills")
+
     def ensure_thread_dirs(self, thread_id: str, *, user_id: str | None = None) -> None:
         """Create all standard sandbox directories for a thread.
 
@@ -330,6 +342,7 @@ class Paths:
             self.sandbox_uploads_dir(thread_id, user_id=user_id),
             self.sandbox_outputs_dir(thread_id, user_id=user_id),
             self.acp_workspace_dir(thread_id, user_id=user_id),
+            self.sandbox_skills_dir(thread_id, user_id=user_id),
         ]:
             d.mkdir(parents=True, exist_ok=True)
             d.chmod(0o777)

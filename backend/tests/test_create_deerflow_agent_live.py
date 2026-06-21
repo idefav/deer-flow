@@ -3,31 +3,31 @@
 Verifies the factory produces a working LangGraph agent that can actually
 process messages end-to-end with a real LLM.
 
-Tests marked ``requires_llm`` are skipped in CI or when OPENAI_API_KEY is unset.
+Tests marked ``requires_llm`` are skipped when the active file/DB model config
+is not ready for the model-backed live gate.
 """
 
-import os
 import uuid
 
 import pytest
 from langchain_core.tools import tool
+from support.live_gate_readiness import mark_requires_llm
 
-requires_llm = pytest.mark.skipif(
-    os.getenv("CI", "").lower() in ("true", "1") or not os.getenv("OPENAI_API_KEY"),
-    reason="Requires LLM API key — skipped in CI or when OPENAI_API_KEY is unset",
-)
+pytestmark = [pytest.mark.live, pytest.mark.requires_llm]
+
+requires_llm = mark_requires_llm
 
 
 def _make_model():
-    """Create a real chat model from environment variables."""
-    from langchain_openai import ChatOpenAI
+    """Create a real chat model from the active file/DB AppConfig."""
+    from support.live_gate_readiness import load_active_app_config_for_requires_llm
 
-    return ChatOpenAI(
-        model=os.getenv("E2E_MODEL_ID", "ep-20251211175242-llcmh"),
-        base_url=os.getenv("E2E_BASE_URL", "https://ark-cn-beijing.bytedance.net/api/v3"),
-        api_key=os.getenv("OPENAI_API_KEY", ""),
-        max_tokens=256,
-        temperature=0,
+    from deerflow.models import create_chat_model
+
+    return create_chat_model(
+        thinking_enabled=False,
+        app_config=load_active_app_config_for_requires_llm(),
+        attach_tracing=False,
     )
 
 

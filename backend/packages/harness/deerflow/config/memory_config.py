@@ -62,6 +62,12 @@ class MemoryConfig(BaseModel):
         le=8000,
         description="Maximum tokens to use for memory injection",
     )
+    max_update_context_tokens: int = Field(
+        default=12000,
+        ge=100,
+        le=64000,
+        description="Maximum tokens from existing memory to include in memory updater prompts",
+    )
     token_counting: Literal["tiktoken", "char"] = Field(
         default="tiktoken",
         description=(

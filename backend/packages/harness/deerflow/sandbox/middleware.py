@@ -63,6 +63,22 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
     async def _release_sandbox_async(self, sandbox_id: str) -> None:
         await asyncio.to_thread(get_sandbox_provider().release, sandbox_id)
 
+    def _materialize_runtime_context(self, runtime: Runtime, sandbox_id: str) -> None:
+        sandbox = get_sandbox_provider().get(sandbox_id)
+        if sandbox is None:
+            return
+        from deerflow.sandbox.tools import _materialize_runtime_context_from_db
+
+        _materialize_runtime_context_from_db(runtime, sandbox, sandbox_id)
+
+    async def _materialize_runtime_context_async(self, runtime: Runtime, sandbox_id: str) -> None:
+        sandbox = get_sandbox_provider().get(sandbox_id)
+        if sandbox is None:
+            return
+        from deerflow.sandbox.tools import _materialize_runtime_context_from_db_async
+
+        await _materialize_runtime_context_from_db_async(runtime, sandbox, sandbox_id)
+
     @override
     def before_agent(self, state: SandboxMiddlewareState, runtime: Runtime) -> dict | None:
         # Skip acquisition if lazy_init is enabled
@@ -75,6 +91,7 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             if thread_id is None:
                 return super().before_agent(state, runtime)
             sandbox_id = self._acquire_sandbox(thread_id)
+            self._materialize_runtime_context(runtime, sandbox_id)
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
             return {"sandbox": {"sandbox_id": sandbox_id}}
         return super().before_agent(state, runtime)
@@ -92,6 +109,7 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
             if thread_id is None:
                 return await super().abefore_agent(state, runtime)
             sandbox_id = await self._acquire_sandbox_async(thread_id)
+            await self._materialize_runtime_context_async(runtime, sandbox_id)
             logger.info(f"Assigned sandbox {sandbox_id} to thread {thread_id}")
             return {"sandbox": {"sandbox_id": sandbox_id}}
         return await super().abefore_agent(state, runtime)

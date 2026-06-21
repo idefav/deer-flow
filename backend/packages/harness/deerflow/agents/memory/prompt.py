@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -437,6 +438,131 @@ def format_memory_for_injection(memory_data: dict[str, Any], max_tokens: int = 2
         result = result[:target_chars] + "\n..."
 
     return result
+
+
+def _copy_summary_section(section: object) -> dict[str, Any]:
+    if not isinstance(section, dict):
+        return {"summary": "", "updatedAt": ""}
+    result: dict[str, Any] = {}
+    summary = section.get("summary")
+    updated_at = section.get("updatedAt")
+    if isinstance(summary, str):
+        result["summary"] = summary
+    if isinstance(updated_at, str):
+        result["updatedAt"] = updated_at
+    return result
+
+
+def _memory_update_base_snapshot(memory_data: dict[str, Any]) -> dict[str, Any]:
+    """Return the hierarchical memory shape without the full fact list."""
+
+    user_data = memory_data.get("user") if isinstance(memory_data.get("user"), dict) else {}
+    history_data = memory_data.get("history") if isinstance(memory_data.get("history"), dict) else {}
+    return {
+        "version": memory_data.get("version", "1.0"),
+        "lastUpdated": memory_data.get("lastUpdated", ""),
+        "user": {
+            "workContext": _copy_summary_section(user_data.get("workContext") if isinstance(user_data, dict) else None),
+            "personalContext": _copy_summary_section(user_data.get("personalContext") if isinstance(user_data, dict) else None),
+            "topOfMind": _copy_summary_section(user_data.get("topOfMind") if isinstance(user_data, dict) else None),
+        },
+        "history": {
+            "recentMonths": _copy_summary_section(history_data.get("recentMonths") if isinstance(history_data, dict) else None),
+            "earlierContext": _copy_summary_section(history_data.get("earlierContext") if isinstance(history_data, dict) else None),
+            "longTermBackground": _copy_summary_section(history_data.get("longTermBackground") if isinstance(history_data, dict) else None),
+        },
+        "facts": [],
+    }
+
+
+def _snapshot_token_count(snapshot: dict[str, Any], *, use_tiktoken: bool) -> int:
+    return _count_tokens(json.dumps(snapshot, indent=2, ensure_ascii=False, sort_keys=True), use_tiktoken=use_tiktoken)
+
+
+def _truncate_longest_summary(snapshot: dict[str, Any]) -> bool:
+    longest: tuple[dict[str, Any], int] | None = None
+    for section_name in ("user", "history"):
+        section_group = snapshot.get(section_name)
+        if not isinstance(section_group, dict):
+            continue
+        for section in section_group.values():
+            if not isinstance(section, dict):
+                continue
+            summary = section.get("summary")
+            if not isinstance(summary, str) or not summary:
+                continue
+            if longest is None or len(summary) > longest[1]:
+                longest = (section, len(summary))
+    if longest is None:
+        return False
+    section, length = longest
+    if length <= 80:
+        section["summary"] = ""
+    else:
+        section["summary"] = section["summary"][: max(80, int(length * 0.7))].rstrip() + "..."
+    return True
+
+
+def _fit_base_snapshot(snapshot: dict[str, Any], max_tokens: int, *, use_tiktoken: bool) -> dict[str, Any]:
+    while _snapshot_token_count(snapshot, use_tiktoken=use_tiktoken) > max_tokens:
+        if not _truncate_longest_summary(snapshot):
+            break
+    return snapshot
+
+
+def _fact_update_snapshot(fact: object) -> dict[str, Any] | None:
+    if not isinstance(fact, dict):
+        return None
+    content = fact.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    result: dict[str, Any] = {
+        "id": fact.get("id"),
+        "content": content.strip(),
+        "category": str(fact.get("category", "context")).strip() or "context",
+        "confidence": _coerce_confidence(fact.get("confidence"), default=0.0),
+    }
+    for key in ("createdAt", "updatedAt", "source", "sourceError"):
+        value = fact.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()
+    return result
+
+
+def _rank_update_facts(facts: object) -> list[dict[str, Any]]:
+    if not isinstance(facts, list):
+        return []
+    normalized = [fact for fact in (_fact_update_snapshot(item) for item in facts) if fact is not None]
+    return sorted(
+        normalized,
+        key=lambda fact: (
+            _coerce_confidence(fact.get("confidence"), default=0.0),
+            str(fact.get("updatedAt") or fact.get("createdAt") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def format_memory_for_update_prompt(memory_data: dict[str, Any], max_tokens: int = 12000, *, use_tiktoken: bool = True) -> str:
+    """Format existing memory for the updater prompt within a bounded budget.
+
+    The persisted memory structure can stay complete in storage. This snapshot
+    keeps hierarchical summaries plus the highest-value facts that fit so the
+    update model does not receive unbounded historical JSON.
+    """
+
+    snapshot = _fit_base_snapshot(
+        _memory_update_base_snapshot(memory_data),
+        max_tokens,
+        use_tiktoken=use_tiktoken,
+    )
+    for fact in _rank_update_facts(memory_data.get("facts")):
+        candidate = dict(snapshot)
+        candidate["facts"] = [*snapshot.get("facts", []), fact]
+        if _snapshot_token_count(candidate, use_tiktoken=use_tiktoken) > max_tokens:
+            continue
+        snapshot = candidate
+    return json.dumps(snapshot, indent=2, ensure_ascii=False, sort_keys=True)
 
 
 def format_conversation_for_update(messages: list[Any]) -> str:

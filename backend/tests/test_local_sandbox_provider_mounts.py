@@ -566,6 +566,60 @@ class TestLocalSandboxProviderMounts:
 
         assert [m.container_path for m in provider._path_mappings] == ["/custom-skills"]
 
+    def test_setup_path_mappings_uses_active_skill_storage_root(self, tmp_path):
+        configured_skills_dir = tmp_path / "configured-skills"
+        configured_skills_dir.mkdir()
+        storage_root = tmp_path / "db-materialized-skills"
+        storage_root.mkdir()
+
+        from deerflow.config.sandbox_config import SandboxConfig
+
+        sandbox_config = SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider", mounts=[])
+        config = SimpleNamespace(
+            skills=SimpleNamespace(container_path="/mnt/skills", get_skills_path=lambda: configured_skills_dir, use="deerflow.skills.storage.local_skill_storage:LocalSkillStorage"),
+            sandbox=sandbox_config,
+        )
+        storage = SimpleNamespace(get_skills_root_path=lambda: storage_root)
+
+        with patch("deerflow.config.get_app_config", return_value=config):
+            with patch("deerflow.sandbox.local.local_sandbox_provider.get_or_new_skill_storage", return_value=storage, create=True):
+                provider = LocalSandboxProvider()
+
+        assert len(provider._path_mappings) == 1
+        assert provider._path_mappings[0].container_path == "/mnt/skills"
+        assert provider._path_mappings[0].local_path == str(storage_root)
+        assert provider._path_mappings[0].read_only is True
+
+    def test_local_sandbox_reads_db_materialized_custom_skill(self, tmp_path, monkeypatch):
+        from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+        from deerflow.config.database_config import DatabaseConfig
+        from deerflow.config.skills_config import SkillsConfig
+        from deerflow.skills.storage import get_or_new_skill_storage, reset_skill_storage
+
+        cache_root = tmp_path / "skills-cache"
+        database = DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
+        app_config = AppConfig.model_validate(
+            {
+                "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                "database": database.model_dump(),
+                "skills": SkillsConfig(path=str(cache_root)).model_dump(),
+            }
+        )
+        content = "---\nname: db-skill\ndescription: DB skill\n---\n\nUse the database.\n"
+        monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+        set_app_config(app_config)
+        reset_skill_storage()
+        try:
+            storage = get_or_new_skill_storage(app_config=app_config)
+            storage.write_custom_skill("db-skill", "SKILL.md", content)
+            provider = LocalSandboxProvider()
+            sandbox = provider.get(provider.acquire())
+            assert sandbox is not None
+            assert sandbox.read_file("/mnt/skills/custom/db-skill/SKILL.md") == content
+        finally:
+            reset_app_config()
+            reset_skill_storage()
+
     def test_setup_path_mappings_skips_relative_host_path(self, tmp_path):
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()

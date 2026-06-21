@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from deerflow.config.agents_config import load_agent_soul
+from deerflow.config.extensions_config import get_extensions_config_revision
 from deerflow.skills.storage import get_or_new_skill_storage
 from deerflow.skills.types import Skill, SkillCategory
 from deerflow.subagents import get_available_subagent_names
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 _ENABLED_SKILLS_REFRESH_WAIT_TIMEOUT_SECONDS = 5.0
 _enabled_skills_lock = threading.Lock()
 _enabled_skills_cache: list[Skill] | None = None
+_enabled_skills_extensions_revision: int | None = None
 _enabled_skills_by_config_cache: dict[int, tuple[object, list[Skill]]] = {}
 _enabled_skills_refresh_active = False
 _enabled_skills_refresh_version = 0
@@ -28,6 +30,14 @@ _enabled_skills_refresh_event = threading.Event()
 
 def _load_enabled_skills_sync() -> list[Skill]:
     return list(get_or_new_skill_storage().load_skills(enabled_only=True))
+
+
+def _get_enabled_skills_extensions_revision() -> int | None:
+    try:
+        return get_extensions_config_revision()
+    except Exception:
+        logger.debug("Could not read extensions config revision for enabled skills cache", exc_info=True)
+        return None
 
 
 def _start_enabled_skills_refresh_thread() -> None:
@@ -39,7 +49,7 @@ def _start_enabled_skills_refresh_thread() -> None:
 
 
 def _refresh_enabled_skills_cache_worker() -> None:
-    global _enabled_skills_cache, _enabled_skills_refresh_active
+    global _enabled_skills_cache, _enabled_skills_extensions_revision, _enabled_skills_refresh_active
 
     while True:
         with _enabled_skills_lock:
@@ -47,13 +57,16 @@ def _refresh_enabled_skills_cache_worker() -> None:
 
         try:
             skills = _load_enabled_skills_sync()
+            extensions_revision = _get_enabled_skills_extensions_revision()
         except Exception:
             logger.exception("Failed to load enabled skills for prompt injection")
             skills = []
+            extensions_revision = None
 
         with _enabled_skills_lock:
             if _enabled_skills_refresh_version == target_version:
                 _enabled_skills_cache = skills
+                _enabled_skills_extensions_revision = extensions_revision
                 _enabled_skills_refresh_active = False
                 _enabled_skills_refresh_event.set()
                 return
@@ -64,12 +77,28 @@ def _refresh_enabled_skills_cache_worker() -> None:
 
 
 def _ensure_enabled_skills_cache() -> threading.Event:
-    global _enabled_skills_refresh_active
+    global _enabled_skills_cache, _enabled_skills_refresh_active, _enabled_skills_refresh_version
 
+    current_extensions_revision = _get_enabled_skills_extensions_revision()
     with _enabled_skills_lock:
         if _enabled_skills_cache is not None:
-            _enabled_skills_refresh_event.set()
-            return _enabled_skills_refresh_event
+            if (
+                _enabled_skills_extensions_revision is None
+                or current_extensions_revision is None
+                or _enabled_skills_extensions_revision == current_extensions_revision
+            ):
+                _enabled_skills_refresh_event.set()
+                return _enabled_skills_refresh_event
+            logger.info(
+                "Enabled skills cache stale due to extensions revision change (%s -> %s)",
+                _enabled_skills_extensions_revision,
+                current_extensions_revision,
+            )
+            _get_cached_skills_prompt_section.cache_clear()
+            _enabled_skills_cache = None
+            _enabled_skills_by_config_cache.clear()
+            _enabled_skills_refresh_version += 1
+            _enabled_skills_refresh_event.clear()
         if _enabled_skills_refresh_active:
             return _enabled_skills_refresh_event
         _enabled_skills_refresh_active = True
@@ -80,11 +109,12 @@ def _ensure_enabled_skills_cache() -> threading.Event:
 
 
 def _invalidate_enabled_skills_cache() -> threading.Event:
-    global _enabled_skills_cache, _enabled_skills_refresh_active, _enabled_skills_refresh_version
+    global _enabled_skills_cache, _enabled_skills_extensions_revision, _enabled_skills_refresh_active, _enabled_skills_refresh_version
 
     _get_cached_skills_prompt_section.cache_clear()
     with _enabled_skills_lock:
         _enabled_skills_cache = None
+        _enabled_skills_extensions_revision = None
         _enabled_skills_by_config_cache.clear()
         _enabled_skills_refresh_version += 1
         _enabled_skills_refresh_event.clear()
@@ -116,15 +146,15 @@ def get_cached_enabled_skills() -> list[Skill]:
     """Return the cached enabled-skills list, kicking off a background refresh on miss.
 
     Safe to call from request paths: never blocks on disk I/O. Returns an empty
-    list on cache miss; the next call will see the warmed result.
+    list on cache miss or stale DB revision; the next call will see the warmed
+    result.
     """
+    _ensure_enabled_skills_cache()
     with _enabled_skills_lock:
         cached = _enabled_skills_cache
 
     if cached is not None:
         return list(cached)
-
-    _ensure_enabled_skills_cache()
     return []
 
 

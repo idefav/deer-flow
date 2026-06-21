@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from deerflow.config.app_config import AppConfig, reset_app_config, set_app_config
+from deerflow.config.database_config import DatabaseConfig
 from deerflow.tools.builtins.setup_agent_tool import setup_agent
 
 # --- Helpers ---
@@ -41,6 +43,10 @@ def _call_setup_agent(tmp_path: Path, soul: str, description: str, agent_name: s
             description=description,
             runtime=_make_runtime(agent_name),
         )
+
+
+def _db_config(tmp_path: Path) -> DatabaseConfig:
+    return DatabaseConfig(backend="sqlite", sqlite_dir=str(tmp_path / "db"))
 
 
 # --- Agent name validation tests ---
@@ -148,6 +154,78 @@ class TestSetupAgentNoDataLoss:
         default_dir = tmp_path / "users" / "default" / "agents" / "test-agent"
         assert (expected_dir / "SOUL.md").read_text() == "# My Agent"
         assert not default_dir.exists()
+
+    @pytest.mark.no_auto_user
+    def test_db_mode_custom_agent_is_written_to_db_not_files(self, tmp_path: Path, monkeypatch):
+        from deerflow.config.agent_store import DbAgentStore
+
+        database = _db_config(tmp_path)
+        set_app_config(
+            AppConfig.model_validate(
+                {
+                    "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                    "database": database.model_dump(),
+                }
+            )
+        )
+        monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+        runtime = _DummyRuntime(
+            context={"agent_name": "db-agent", "user_id": "alice"},
+            tool_call_id="tool-db",
+        )
+
+        try:
+            result = setup_agent.func(
+                soul="# DB Agent",
+                description="A DB-backed agent",
+                skills=[],
+                runtime=runtime,
+            )
+        finally:
+            reset_app_config()
+
+        assert "created successfully" in result.update["messages"][0].content
+        store = DbAgentStore(database_config=database)
+        stored = store.load_agent_config("alice", "db-agent")
+        assert stored is not None
+        assert stored.description == "A DB-backed agent"
+        assert stored.skills == []
+        assert store.load_agent_soul("alice", "db-agent") == "# DB Agent"
+        assert not (tmp_path / "users" / "alice" / "agents" / "db-agent").exists()
+
+    @pytest.mark.no_auto_user
+    def test_db_mode_default_agent_soul_is_written_to_db_not_global_file(self, tmp_path: Path, monkeypatch):
+        from deerflow.config.agent_store import DbAgentStore
+
+        database = _db_config(tmp_path)
+        set_app_config(
+            AppConfig.model_validate(
+                {
+                    "sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"},
+                    "database": database.model_dump(),
+                }
+            )
+        )
+        monkeypatch.setenv("DEER_FLOW_CONFIG_SOURCE", "db")
+        runtime = _DummyRuntime(
+            context={"agent_name": None, "user_id": "alice"},
+            tool_call_id="tool-db-default",
+        )
+
+        try:
+            with patch("deerflow.tools.builtins.setup_agent_tool.get_paths", return_value=_make_paths_mock(tmp_path)):
+                result = setup_agent.func(
+                    soul="# DB Default Agent",
+                    description="Default DB-backed agent",
+                    runtime=runtime,
+                )
+        finally:
+            reset_app_config()
+
+        assert "created successfully" in result.update["messages"][0].content
+        store = DbAgentStore(database_config=database)
+        assert store.load_default_agent_soul("alice") == "# DB Default Agent"
+        assert not (tmp_path / "SOUL.md").exists()
 
 
 # --- Empty soul guard tests  ---
